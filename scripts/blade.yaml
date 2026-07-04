@@ -1,0 +1,9 @@
+path: /home/fulin/haiyanghuang/blade_yolo/datasets
+train: images/calibration
+val: images/val
+
+names:
+  0: crack
+  1: corrosion
+  2: coating_loss
+  3: material_loss

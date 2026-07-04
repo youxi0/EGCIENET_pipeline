@@ -1,0 +1,28 @@
+# Build artifacts
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+
+# Runtime outputs and logs
+results/
+*.log
+
+# Local datasets and large model files
+data/
+datasets/
+models/
+runs/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
