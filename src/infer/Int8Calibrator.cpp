@@ -1,6 +1,8 @@
 #include "infer/Int8Calibrator.h"
+
 #include "utils/FileLogger.h"
 
+#include <cuda_runtime_api.h>
 #include <opencv2/imgcodecs.hpp>
 
 #include <algorithm>
@@ -9,7 +11,6 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <sstream>
 #include <utility>
 
@@ -17,10 +18,21 @@ namespace fs = std::filesystem;
 
 Int8Calibrator::Int8Calibrator(Int8CalibratorConfig config)
     : config_(std::move(config)),
-      preprocessor_(config_.inputWidth, config_.inputHeight) {
-    // 第一步：检查会直接影响输入显存大小的基础配置。
+      preprocessor_(PreprocessConfig{
+          config_.inputWidth,
+          config_.inputHeight,
+          config_.mean,
+          config_.std
+      }) {
     if (config_.batchSize <= 0 || config_.inputWidth <= 0 || config_.inputHeight <= 0) {
         setError("batch size and input dimensions must be positive");
+        return;
+    }
+
+    if (std::any_of(config_.std.begin(), config_.std.end(), [](float value) {
+            return value == 0.0f;
+        })) {
+        setError("preprocess std values must be non-zero");
         return;
     }
 
@@ -30,9 +42,7 @@ Int8Calibrator::Int8Calibrator(Int8CalibratorConfig config)
     batchElementCount_ = static_cast<size_t>(config_.batchSize) * imageElementCount_;
     deviceInputBytes_ = batchElementCount_ * sizeof(float);
 
-    // 第二步：收集并排序校准图片，保证每次构建使用相同顺序，方便复现实验。
     if (!collectImages()) {
-        // cache存在时允许没有图片，因为TensorRT通常不会再调用getBatch。
         if (hasReadableCache()) {
             valid_ = true;
             utils::FileLogger::instance().warning(
@@ -42,7 +52,6 @@ Int8Calibrator::Int8Calibrator(Int8CalibratorConfig config)
         return;
     }
 
-    // 第三步：申请Host batch和TensorRT校准所需的Device输入buffer。
     if (!allocateDeviceBuffer()) {
         return;
     }
@@ -52,7 +61,8 @@ Int8Calibrator::Int8Calibrator(Int8CalibratorConfig config)
     std::ostringstream oss;
     oss << "[INT8 Calibrator] ready, images=" << imagePaths_.size()
         << ", batch=" << config_.batchSize
-        << ", input=3x" << config_.inputHeight << "x" << config_.inputWidth;
+        << ", input=1x3x" << config_.inputHeight << "x" << config_.inputWidth
+        << ", input_name=" << config_.inputTensorName;
     utils::FileLogger::instance().info(oss.str());
 }
 
@@ -84,13 +94,11 @@ bool Int8Calibrator::getBatch(
             return false;
         }
 
-        // 第一步：在CPU端生成一个NCHW FP32 batch，预处理与baseline保持一致。
         size_t validImageCount = 0;
         if (!prepareBatch(validImageCount)) {
             return false;
         }
 
-        // 第二步：同步拷贝到GPU。getBatch返回前，bindings必须指向有效Device内存。
         const cudaError_t status = cudaMemcpy(
             deviceInput_,
             hostBatch_.data(),
@@ -99,13 +107,10 @@ bool Int8Calibrator::getBatch(
         );
 
         if (status != cudaSuccess) {
-            setError(
-                std::string("cudaMemcpy H2D failed: ") + cudaGetErrorString(status)
-            );
+            setError(std::string("cudaMemcpy H2D failed: ") + cudaGetErrorString(status));
             return false;
         }
 
-        // 第三步：找到模型图像输入对应的位置，把GPU地址交给TensorRT。
         const int inputIndex = findInputBinding(names, nbBindings);
         if (inputIndex < 0) {
             setError("cannot find TensorRT calibration input binding");
@@ -186,7 +191,6 @@ void Int8Calibrator::writeCalibrationCache(const void* cache, size_t length) noe
         const fs::path cachePath(config_.cacheFile);
         const fs::path parent = cachePath.parent_path();
 
-        // cache目录不存在时先创建，避免ofstream打开失败。
         if (!parent.empty()) {
             std::error_code ec;
             fs::create_directories(parent, ec);
@@ -244,7 +248,6 @@ bool Int8Calibrator::collectImages() {
         return false;
     }
 
-    // 使用recursive_directory_iterator，校准图片可以按子目录组织。
     fs::recursive_directory_iterator iterator(
         imageDirectory,
         fs::directory_options::skip_permission_denied,
@@ -302,7 +305,6 @@ bool Int8Calibrator::allocateDeviceBuffer() {
 bool Int8Calibrator::prepareBatch(size_t& validImageCount) {
     validImageCount = 0;
 
-    // 读取失败的图片会被跳过，直到batch填满或图片耗尽。
     while (
         validImageCount < static_cast<size_t>(config_.batchSize) &&
         nextImageIndex_ < imagePaths_.size()
@@ -324,7 +326,6 @@ bool Int8Calibrator::prepareBatch(size_t& validImageCount) {
         return false;
     }
 
-    // TensorRT要求固定batch大小。最后不足一个batch时，重复最后一张有效图片补齐。
     for (
         size_t batchIndex = validImageCount;
         batchIndex < static_cast<size_t>(config_.batchSize);
@@ -348,7 +349,6 @@ bool Int8Calibrator::copyImageToBatch(
         return false;
     }
 
-    // 复用baseline的Preprocessor，确保letterbox、BGR->RGB和1/255归一化完全一致。
     PreprocessResult prep = preprocessor_.process(image);
     if (prep.blob.empty() || prep.blob.type() != CV_32F) {
         return false;
@@ -399,7 +399,6 @@ int Int8Calibrator::findInputBinding(
         return -1;
     }
 
-    // YOLO通常只有一个输入；未指定名字时默认使用第0个输入。
     if (config_.inputTensorName.empty()) {
         return 0;
     }

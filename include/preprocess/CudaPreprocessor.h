@@ -28,8 +28,8 @@ private:
     void release();
 
 private:
-    int inputW_ = 640;
-    int inputH_ = 640;
+    int inputW_ = 352;
+    int inputH_ = 352;
 
    
     unsigned char* imageDevice_ = nullptr;

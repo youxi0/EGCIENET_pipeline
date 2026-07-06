@@ -1,5 +1,4 @@
 #include "infer/TensorRTInfer.h"
-#include "utils/FileLogger.h"
 
 #include <cuda_fp16.h>
 
@@ -20,6 +19,7 @@
         } \
     } while (0)
 
+#if 0
 void TrtLogger::log(Severity severity, const char* msg) noexcept
 {
     if (severity <= Severity::kWARNING)
@@ -44,6 +44,8 @@ void TrtLogger::log(Severity severity, const char* msg) noexcept
         }
     }
 }
+
+#endif
 
 TensorRTInfer::TensorRTInfer(const std::string& enginePath)
     : enginePath_(enginePath)
@@ -218,7 +220,7 @@ bool TensorRTInfer::allocateBuffers()
         {
             if (hasDynamicDim(dims))
             {
-                nvinfer1::Dims4 inputDims(1, 3, 640, 640);
+                nvinfer1::Dims4 inputDims(1, 3, 352, 352);
                 //模块:setBindingDimensions设置动态输入shape,这里固定为1x3x640x640
                 bool ok = context_->setBindingDimensions(i, inputDims); 
                 if (!ok)

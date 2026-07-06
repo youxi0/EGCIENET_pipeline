@@ -1,18 +1,46 @@
 #include "infer/EngineBuilder.h"
+
 #include "infer/Int8Calibrator.h"
 #include "utils/FileLogger.h"
 
+#include <NvInferVersion.h>
 #include <NvOnnxParser.h>
 
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <memory>
 #include <sstream>
 #include <utility>
 
 namespace fs = std::filesystem;
+
+namespace {
+
+std::string dimsToString(const nvinfer1::Dims& dims) {
+    std::ostringstream oss;
+    oss << "[";
+    for (int i = 0; i < dims.nbDims; ++i) {
+        oss << dims.d[i];
+        if (i + 1 < dims.nbDims) {
+            oss << ", ";
+        }
+    }
+    oss << "]";
+    return oss.str();
+}
+
+void setWorkspaceSize(nvinfer1::IBuilderConfig& builderConfig, size_t workspaceSizeMiB) {
+    const size_t workspaceBytes = workspaceSizeMiB * 1024ULL * 1024ULL;
+
+#if NV_TENSORRT_MAJOR > 8 || (NV_TENSORRT_MAJOR == 8 && NV_TENSORRT_MINOR >= 4)
+    builderConfig.setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspaceBytes);
+#else
+    builderConfig.setMaxWorkspaceSize(workspaceBytes);
+#endif
+}
+
+} // namespace
 
 EngineBuilder::EngineBuilder(EngineBuilderConfig config)
     : config_(std::move(config)) {}
@@ -36,7 +64,6 @@ bool EngineBuilder::build() {
         return false;
     }
 
-    // 第一步：创建显式batch网络。YOLO导出的ONNX通常是NCHW显式batch格式。
     const uint32_t explicitBatchFlag =
         1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
     std::unique_ptr<nvinfer1::INetworkDefinition, TrtDestroy<nvinfer1::INetworkDefinition>> network(
@@ -59,6 +86,25 @@ bool EngineBuilder::build() {
         return false;
     }
 
+    for (int i = 0; i < network->getNbInputs(); ++i) {
+        const nvinfer1::ITensor* input = network->getInput(i);
+        if (input != nullptr) {
+            utils::FileLogger::instance().info(
+                std::string("[EngineBuilder] input ") + input->getName() +
+                " shape=" + dimsToString(input->getDimensions())
+            );
+        }
+    }
+    for (int i = 0; i < network->getNbOutputs(); ++i) {
+        const nvinfer1::ITensor* output = network->getOutput(i);
+        if (output != nullptr) {
+            utils::FileLogger::instance().info(
+                std::string("[EngineBuilder] output ") + output->getName() +
+                " shape=" + dimsToString(output->getDimensions())
+            );
+        }
+    }
+
     std::unique_ptr<nvinfer1::IBuilderConfig, TrtDestroy<nvinfer1::IBuilderConfig>> builderConfig(
         builder->createBuilderConfig()
     );
@@ -67,7 +113,7 @@ bool EngineBuilder::build() {
         return false;
     }
 
-    builderConfig->setMaxWorkspaceSize(config_.workspaceSizeMiB * 1024ULL * 1024ULL);
+    setWorkspaceSize(*builderConfig, config_.workspaceSizeMiB);
 
     std::vector<std::unique_ptr<nvinfer1::IOptimizationProfile, TrtDestroy<nvinfer1::IOptimizationProfile>>> profiles;
     if (!configureOptimizationProfile(*builder, *network, *builderConfig, profiles)) {
@@ -79,7 +125,6 @@ bool EngineBuilder::build() {
         return false;
     }
 
-    // 第四步：buildSerializedNetwork执行真正的TensorRT构建；INT8校准也会在这里被触发。
     std::unique_ptr<nvinfer1::IHostMemory, TrtDestroy<nvinfer1::IHostMemory>> plan(
         builder->buildSerializedNetwork(*network, *builderConfig)
     );
@@ -133,6 +178,13 @@ bool EngineBuilder::validateConfig() {
 
     if (config_.calibrateBatchSize <= 0) {
         setError("calibration batch size must be positive");
+        return false;
+    }
+
+    if (std::any_of(config_.std.begin(), config_.std.end(), [](float value) {
+            return value == 0.0f;
+        })) {
+        setError("preprocess std values must be non-zero");
         return false;
     }
 
@@ -204,10 +256,11 @@ bool EngineBuilder::configurePrecision(
     calibratorConfig.batchSize = config_.calibrateBatchSize;
     calibratorConfig.inputWidth = config_.inputWidth;
     calibratorConfig.inputHeight = config_.inputHeight;
+    calibratorConfig.mean = config_.mean;
+    calibratorConfig.std = config_.std;
     calibratorConfig.maxImages = config_.calibrateMaxImages;
     calibratorConfig.readCache = config_.readCalibrationCache;
 
-    // 第三步：INT8构建必须把calibrator挂到builder config上；build期间calibrator要保持存活。
     calibrator = std::make_unique<Int8Calibrator>(calibratorConfig);
     if (!calibrator->isValid()) {
         setError("INT8 calibrator is invalid: " + calibrator->lastError());
@@ -291,10 +344,9 @@ bool EngineBuilder::configureOptimizationProfile(
 
         std::ostringstream oss;
         oss << "[EngineBuilder] dynamic profile for input=" << inputName
-            << ", min_batch=" << config_.minBatch
-            << ", opt_batch=" << config_.optBatch
-            << ", max_batch=" << config_.maxBatch
-            << ", hw=" << config_.inputHeight << "x" << config_.inputWidth;
+            << ", min=" << dimsToString(minDims)
+            << ", opt=" << dimsToString(optDims)
+            << ", max=" << dimsToString(maxDims);
         utils::FileLogger::instance().info(oss.str());
     }
 
@@ -361,7 +413,6 @@ nvinfer1::Dims EngineBuilder::makeProfileDims(
 ) const {
     nvinfer1::Dims dims = originalDims;
 
-    // 显式batch常见shape是NCHW；只填充动态维度，静态维度保持ONNX原值。
     if (dims.nbDims == 4) {
         if (dims.d[0] < 0) {
             dims.d[0] = batch;

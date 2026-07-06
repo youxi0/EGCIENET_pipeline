@@ -1,11 +1,11 @@
 #pragma once
 
-#include "infer/TensorRTInfer.h"
+#include "infer/TensorRTCommon.h"
 
 #include <NvInfer.h>
 
+#include <array>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,17 +28,21 @@ struct EngineBuilderConfig {
 
     EnginePrecision precision = EnginePrecision::kFP16;
 
-    // 构建动态shape engine时使用的输入尺寸；静态ONNX会保留原始shape。
-    int inputWidth = 640;
-    int inputHeight = 640;
+    // Model input contract for EGCINET: image, NCHW, BGR, 1x3x352x352.
+    std::string inputTensorName = "image";
+    int inputWidth = 352;
+    int inputHeight = 352;
     int minBatch = 1;
     int optBatch = 1;
     int maxBatch = 1;
 
-    // INT8 PTQ校准配置；precision=int8时会创建Int8Calibrator并挂到builder config上。
+    // BGR order, raw 0-255 pixel scale.
+    std::array<float, 3> mean{140.505f, 157.845f, 135.66f};
+    std::array<float, 3> std{61.455f, 60.18f, 62.22f};
+
+    // INT8 PTQ calibration settings.
     std::string calibrateImageDir;
-    std::string calibrateCacheFile = "models/best_int8.cache";
-    std::string inputTensorName;
+    std::string calibrateCacheFile = "models/egcinet_352_int8.cache";
     int calibrateBatchSize = 1;
     size_t calibrateMaxImages = 500;
     bool readCalibrationCache = true;
@@ -48,32 +52,39 @@ struct EngineBuilderConfig {
     bool verbose = false;
 };
 
-// TensorRT engine构建器：
-// 1. 解析ONNX网络。
-// 2. 按fp32/fp16/int8配置builder。
-// 3. INT8模式下使用Int8Calibrator生成或复用校准cache。
-// 4. 序列化输出.engine文件，供TensorRTInfer运行时加载。
 class EngineBuilder {
 public:
     explicit EngineBuilder(EngineBuilderConfig config);
 
+    // Parses ONNX, configures TensorRT precision/profile, and writes the engine plan.
     bool build();
+
+    // Returns the latest human-readable error after build() fails.
     const std::string& lastError() const noexcept;
 
 private:
+    // Checks required files, dimensions, calibration settings, and batch profile order.
     bool validateConfig();
+
+    // Runs the ONNX parser and captures parser diagnostics on failure.
     bool parseOnnx(nvonnxparser::IParser& parser);
+
+    // Enables FP16/INT8 flags and attaches the INT8 calibrator when requested.
     bool configurePrecision(
         nvinfer1::IBuilder& builder,
         nvinfer1::IBuilderConfig& builderConfig,
         std::unique_ptr<Int8Calibrator>& calibrator
     );
+
+    // Adds an optimization profile only when the ONNX input has dynamic dimensions.
     bool configureOptimizationProfile(
         nvinfer1::IBuilder& builder,
         nvinfer1::INetworkDefinition& network,
         nvinfer1::IBuilderConfig& builderConfig,
         std::vector<std::unique_ptr<nvinfer1::IOptimizationProfile, TrtDestroy<nvinfer1::IOptimizationProfile>>>& profiles
     );
+
+    // Serializes the built engine to disk, creating the parent directory if needed.
     bool writeEnginePlan(const nvinfer1::IHostMemory& plan);
 
     bool hasDynamicDim(const nvinfer1::Dims& dims) const;

@@ -15,5 +15,4 @@ cmake ..
 cmake --build . -j10
 
 echo "[INFO] build finished"
-echo "[INFO] executable: ${BUILD_DIR}/bin/blade_demo"
-echo "[INFO] executable: ${BUILD_DIR}/bin/blade_build_engine"
+echo "[INFO] executable: ${BUILD_DIR}/bin/egcinet_build_engine"
