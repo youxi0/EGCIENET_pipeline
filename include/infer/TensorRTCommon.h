@@ -21,7 +21,9 @@ struct HasTensorRTDestroy<T, std::void_t<decltype(std::declval<T*>()->destroy())
 
 } // namespace trt_detail
 
-// RAII deleter that supports both old TensorRT destroy() objects and newer delete-only objects.
+// RAII deleter for TensorRT objects across API versions.
+// Some TensorRT 8.x objects, such as IOptimizationProfile, expose neither destroy()
+// nor a public destructor. Those objects are owned by TensorRT internals after creation.
 template <typename T>
 class TrtDestroy {
 public:
@@ -32,8 +34,10 @@ public:
 
         if constexpr (trt_detail::HasTensorRTDestroy<T>::value) {
             obj->destroy();
-        } else {
+        } else if constexpr (std::is_destructible<T>::value) {
             delete obj;
+        } else {
+            (void)obj;
         }
     }
 };
