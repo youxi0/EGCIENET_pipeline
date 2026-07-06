@@ -12,7 +12,7 @@ find_package(OpenCV REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
-set(TENSORRT_ROOT "" CACHE PATH "TensorRT install root, for example /usr/src/tensorrt")
+set(TENSORRT_ROOT "" CACHE PATH "home/fulin/haiyanghuang/TensorRT-8.6.1.6")
 set(_TENSORRT_HINTS
     ${TENSORRT_ROOT}
     $ENV{TENSORRT_ROOT}
