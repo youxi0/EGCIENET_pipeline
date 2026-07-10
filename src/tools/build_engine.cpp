@@ -10,7 +10,7 @@
 
 namespace {
 
-// Returns the value immediately following a CLI key, or defaultValue when absent.
+// 返回命令行参数名后面的值；缺省时返回默认值。
 std::string getArg(
     int argc,
     char** argv,
@@ -26,7 +26,7 @@ std::string getArg(
     return defaultValue;
 }
 
-// Checks whether a flag-like CLI key is present.
+// 检查命令行里是否出现某个标志位。
 bool hasFlag(int argc, char** argv, const std::string& key) {
     for (int i = 1; i < argc; ++i) {
         if (argv[i] == key) {
@@ -37,7 +37,7 @@ bool hasFlag(int argc, char** argv, const std::string& key) {
     return false;
 }
 
-// Normalizes small option strings before boolean and precision parsing.
+// 将短选项字符串转成小写，便于解析布尔值和精度类型。
 std::string toLower(std::string value) {
     std::transform(
         value.begin(),
@@ -48,7 +48,7 @@ std::string toLower(std::string value) {
     return value;
 }
 
-// Parses user-facing true/false strings while keeping a default for empty input.
+// 解析用户传入的真假字符串；空字符串沿用默认值。
 bool parseBool(const std::string& value, bool defaultValue) {
     if (value.empty()) {
         return defaultValue;
@@ -58,7 +58,7 @@ bool parseBool(const std::string& value, bool defaultValue) {
     return lower == "1" || lower == "true" || lower == "yes" || lower == "on";
 }
 
-// Converts CLI precision text to the strongly typed builder enum.
+// 将命令行精度字符串转换为强类型枚举。
 EnginePrecision parsePrecision(const std::string& value) {
     const std::string lower = toLower(value);
     if (lower == "fp32") {
@@ -71,7 +71,7 @@ EnginePrecision parsePrecision(const std::string& value) {
     return EnginePrecision::kFP16;
 }
 
-// Parses a BGR triplet in the form "v0,v1,v2".
+// 解析形如 "v0,v1,v2" 的 BGR 三元组。
 bool parseFloatTriplet(const std::string& text, std::array<float, 3>& values) {
     if (text.empty()) {
         return true;
@@ -90,7 +90,7 @@ bool parseFloatTriplet(const std::string& text, std::array<float, 3>& values) {
     return !std::getline(ss, item, ',');
 }
 
-// Prints build examples and all supported CLI options.
+// 打印构建示例和所有支持的命令行参数。
 void printUsage(const char* app) {
     std::cout
         << "Usage:\n"
@@ -115,11 +115,12 @@ void printUsage(const char* app) {
         << "  --calib_max_images     max calibration images, 0 means all, default 500\n"
         << "  --read_calib_cache     0 | 1, default 1\n"
         << "  --fp16_fallback        0 | 1, default 1 for INT8\n"
+        << "  --force_layernorm_fp32 0 | 1, default 1 for FP16/INT8\n"
         << "  --log_dir              log output dir, default results/logs\n"
         << "  --verbose              print more TensorRT parser logs\n";
 }
 
-} // namespace
+} // 匿名命名空间
 
 int main(int argc, char** argv) {
     if (hasFlag(argc, argv, "--help") || hasFlag(argc, argv, "-h")) {
@@ -153,6 +154,7 @@ int main(int argc, char** argv) {
     );
     config.readCalibrationCache = parseBool(getArg(argc, argv, "--read_calib_cache", "1"), true);
     config.allowFp16Fallback = parseBool(getArg(argc, argv, "--fp16_fallback", "1"), true);
+    config.forceLayerNormFp32 = parseBool(getArg(argc, argv, "--force_layernorm_fp32", "1"), true);
     config.verbose = hasFlag(argc, argv, "--verbose");
 
     if (!parseFloatTriplet(getArg(argc, argv, "--mean"), config.mean) ||

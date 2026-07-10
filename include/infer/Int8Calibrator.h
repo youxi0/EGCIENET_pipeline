@@ -18,11 +18,11 @@ struct Int8CalibratorConfig {
     int inputWidth = 352;
     int inputHeight = 352;
 
-    // BGR order, matching cv::imread and the exported model contract.
+    // BGR 顺序，与 cv::imread 和导出模型约定保持一致。
     std::array<float, 3> mean{140.505f, 157.845f, 135.66f};
     std::array<float, 3> std{61.455f, 60.18f, 62.22f};
 
-    // 0 uses all supported images after deterministic path sorting.
+    // 0 表示使用排序后的全部可支持图片。
     size_t maxImages = 0;
     bool readCache = true;
 };
@@ -35,54 +35,54 @@ public:
     Int8Calibrator(const Int8Calibrator&) = delete;
     Int8Calibrator& operator=(const Int8Calibrator&) = delete;
 
-    // Returns the fixed calibration batch size requested by TensorRT.
+    // 返回 TensorRT 校准阶段使用的固定 batch size。
     int getBatchSize() const noexcept override;
 
-    // Provides one GPU input batch to TensorRT during entropy calibration.
+    // 熵校准期间向 TensorRT 提供一个 GPU 输入 batch。
     bool getBatch(
         void* bindings[],
         const char* names[],
         int nbBindings
     ) noexcept override;
 
-    // Lets TensorRT reuse a previous calibration cache when available.
+    // 如果已有校准 cache，允许 TensorRT 复用。
     const void* readCalibrationCache(size_t& length) noexcept override;
 
-    // Persists the calibration table produced by TensorRT after a fresh run.
+    // 首次校准后保存 TensorRT 生成的校准表。
     void writeCalibrationCache(const void* cache, size_t length) noexcept override;
 
-    // Reports whether construction collected data or found a reusable cache.
+    // 表示构造阶段是否成功收集图片或找到可复用 cache。
     bool isValid() const noexcept;
 
-    // Returns the latest error captured during construction or calibration callbacks.
+    // 返回构造或校准回调期间捕获的最近错误。
     const std::string& lastError() const noexcept;
 
-    // Returns the number of calibration images selected from imageDirectory.
+    // 返回从 imageDirectory 中选中的校准图片数量。
     size_t imageCount() const noexcept;
 
 private:
-    // Recursively collects supported images and sorts paths for reproducible calibration.
+    // 递归收集可支持图片并排序，保证校准可复现。
     bool collectImages();
 
-    // Allocates the host staging batch and TensorRT device input buffer.
+    // 分配 host staging batch 和 TensorRT device 输入 buffer。
     bool allocateDeviceBuffer();
 
-    // Loads and preprocesses images until one fixed-size calibration batch is ready.
+    // 加载并预处理图片，直到组成一个固定大小的校准 batch。
     bool prepareBatch(size_t& validImageCount);
 
-    // Reads one image, preprocesses it to BGR NCHW FP32, and copies it into hostBatch_.
+    // 读取单张图片，预处理成 BGR NCHW FP32，并拷贝到 hostBatch_。
     bool copyImageToBatch(const std::string& imagePath, size_t batchIndex);
 
-    // Checks image extensions supported by OpenCV image loading.
+    // 检查图片扩展名是否为 OpenCV 支持的格式。
     bool isSupportedImage(const std::string& path) const;
 
-    // Finds the TensorRT binding that corresponds to inputTensorName.
+    // 查找 inputTensorName 对应的 TensorRT binding。
     int findInputBinding(const char* names[], int nbBindings) const;
 
-    // Checks whether a non-empty calibration cache can be read from disk.
+    // 检查磁盘上是否存在非空且可读的校准 cache。
     bool hasReadableCache() const;
 
-    // Stores and logs the latest calibration error.
+    // 保存并记录最近一次校准错误。
     void setError(const std::string& message);
 
 private:

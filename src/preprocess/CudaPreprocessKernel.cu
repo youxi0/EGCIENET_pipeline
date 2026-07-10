@@ -1,17 +1,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
 #include <cmath>
 #include <cstddef>
-
-// 判断这个点是不是 padding 区域
-// 如果是 padding，填 114 / 255
-// 如果不是 padding，反算到原图 srcX / srcY
-// 读取 OpenCV BGR 像素
-// BGR -> RGB
-// uint8 -> float
-// HWC -> CHW
-// 写入 TensorRT 输入 buffer
-
 
 __device__ float bilinearSample(
     const unsigned char* src,
@@ -25,21 +16,21 @@ __device__ float bilinearSample(
     srcX = fminf(fmaxf(srcX, 0.0f), static_cast<float>(srcW - 1));
     srcY = fminf(fmaxf(srcY, 0.0f), static_cast<float>(srcH - 1));
 
-    int x1 = static_cast<int>(floorf(srcX));
-    int y1 = static_cast<int>(floorf(srcY));
-    int x2 = min(x1 + 1, srcW - 1);
-    int y2 = min(y1 + 1, srcH - 1);
+    const int x1 = static_cast<int>(floorf(srcX));
+    const int y1 = static_cast<int>(floorf(srcY));
+    const int x2 = min(x1 + 1, srcW - 1);
+    const int y2 = min(y1 + 1, srcH - 1);
 
-    float dx = srcX - x1;
-    float dy = srcY - y1;
+    const float dx = srcX - static_cast<float>(x1);
+    const float dy = srcY - static_cast<float>(y1);
 
-    float v11 = static_cast<float>(src[y1 * srcStep + x1 * 3 + channel]);
-    float v12 = static_cast<float>(src[y1 * srcStep + x2 * 3 + channel]);
-    float v21 = static_cast<float>(src[y2 * srcStep + x1 * 3 + channel]);
-    float v22 = static_cast<float>(src[y2 * srcStep + x2 * 3 + channel]);
+    const float v11 = static_cast<float>(src[y1 * srcStep + x1 * 3 + channel]);
+    const float v12 = static_cast<float>(src[y1 * srcStep + x2 * 3 + channel]);
+    const float v21 = static_cast<float>(src[y2 * srcStep + x1 * 3 + channel]);
+    const float v22 = static_cast<float>(src[y2 * srcStep + x2 * 3 + channel]);
 
-    float top = v11 * (1.0f - dx) + v12 * dx;
-    float bottom = v21 * (1.0f - dx) + v22 * dx;
+    const float top = v11 * (1.0f - dx) + v12 * dx;
+    const float bottom = v21 * (1.0f - dx) + v22 * dx;
 
     return top * (1.0f - dy) + bottom * dy;
 }
@@ -53,53 +44,42 @@ __global__ void preprocessKernel(
     int dstW,
     int dstH,
     size_t dstElementSize,
-    float scale,
-    int padX,
-    int padY
+    float meanB,
+    float meanG,
+    float meanR,
+    float stdB,
+    float stdG,
+    float stdR
 ) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= dstW || y >= dstH) {
         return;
     }
 
-    int dstIndex = y * dstW + x;
-    int area = dstW * dstH;
+    const float scaleX = static_cast<float>(srcW) / static_cast<float>(dstW);
+    const float scaleY = static_cast<float>(srcH) / static_cast<float>(dstH);
+    const float srcX = (static_cast<float>(x) + 0.5f) * scaleX - 0.5f;
+    const float srcY = (static_cast<float>(y) + 0.5f) * scaleY - 0.5f;
 
-    float r = 114.0f / 255.0f;
-    float g = 114.0f / 255.0f;
-    float b = 114.0f / 255.0f;
+    const float b = (bilinearSample(src, srcW, srcH, srcStep, srcX, srcY, 0) - meanB) / stdB;
+    const float g = (bilinearSample(src, srcW, srcH, srcStep, srcX, srcY, 1) - meanG) / stdG;
+    const float r = (bilinearSample(src, srcW, srcH, srcStep, srcX, srcY, 2) - meanR) / stdR;
 
-    int resizedW = static_cast<int>(roundf(srcW * scale));
-    int resizedH = static_cast<int>(roundf(srcH * scale));
+    const int dstIndex = y * dstW + x;
+    const int area = dstW * dstH;
 
-    bool inValidRegion =
-        x >= padX &&
-        x < padX + resizedW &&
-        y >= padY &&
-        y < padY + resizedH;
-
-    if (inValidRegion) {
-        //每个像素占据1，所以取中心就是srcx + 0.5 = （x + 0.5）/ scale
-        float srcX = (static_cast<float>(x - padX) + 0.5f) / scale - 0.5f;
-        float srcY = (static_cast<float>(y - padY) + 0.5f) / scale - 0.5f;
-
-        b = bilinearSample(src, srcW, srcH, srcStep, srcX, srcY, 0) / 255.0f;
-        g = bilinearSample(src, srcW, srcH, srcStep, srcX, srcY, 1) / 255.0f;
-        r = bilinearSample(src, srcW, srcH, srcStep, srcX, srcY, 2) / 255.0f;
-    }
-    // 修改点: FP16 engine的输入binding可能是half，这里按真实元素大小写入，避免显存布局错误。
     if (dstElementSize == sizeof(__half)) {
         __half* halfDst = static_cast<__half*>(dst);
-        halfDst[0 * area + dstIndex] = __float2half_rn(r);
+        halfDst[0 * area + dstIndex] = __float2half_rn(b);
         halfDst[1 * area + dstIndex] = __float2half_rn(g);
-        halfDst[2 * area + dstIndex] = __float2half_rn(b);
+        halfDst[2 * area + dstIndex] = __float2half_rn(r);
     } else {
         float* floatDst = static_cast<float*>(dst);
-        floatDst[0 * area + dstIndex] = r;
+        floatDst[0 * area + dstIndex] = b;
         floatDst[1 * area + dstIndex] = g;
-        floatDst[2 * area + dstIndex] = b;
+        floatDst[2 * area + dstIndex] = r;
     }
 }
 
@@ -112,13 +92,16 @@ void launchPreprocessKernel(
     int dstW,
     int dstH,
     size_t dstElementSize,
-    float scale,
-    int padX,
-    int padY,
+    float meanB,
+    float meanG,
+    float meanR,
+    float stdB,
+    float stdG,
+    float stdR,
     cudaStream_t stream
 ) {
-    dim3 block(16, 16);
-    dim3 grid(
+    const dim3 block(16, 16);
+    const dim3 grid(
         (dstW + block.x - 1) / block.x,
         (dstH + block.y - 1) / block.y
     );
@@ -132,8 +115,11 @@ void launchPreprocessKernel(
         dstW,
         dstH,
         dstElementSize,
-        scale,
-        padX,
-        padY
+        meanB,
+        meanG,
+        meanR,
+        stdB,
+        stdG,
+        stdR
     );
 }

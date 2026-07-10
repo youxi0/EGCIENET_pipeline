@@ -2,8 +2,6 @@
 
 #include <cuda_fp16.h>
 
-#include <algorithm>
-#include <cmath>
 #include <iostream>
 
 void launchPreprocessKernel(
@@ -15,15 +13,20 @@ void launchPreprocessKernel(
     int dstW,
     int dstH,
     size_t dstElementSize,
-    float scale,
-    int padX,
-    int padY,
+    float meanB,
+    float meanG,
+    float meanR,
+    float stdB,
+    float stdG,
+    float stdR,
     cudaStream_t stream
 );
 
 CudaPreprocessor::CudaPreprocessor(int inputW, int inputH)
-    : inputW_(inputW),
-      inputH_(inputH) {}
+    : config_{inputW, inputH, {140.505f, 157.845f, 135.66f}, {61.455f, 60.18f, 62.22f}} {}
+
+CudaPreprocessor::CudaPreprocessor(PreprocessConfig config)
+    : config_(config) {}
 
 CudaPreprocessor::~CudaPreprocessor() {
     release();
@@ -86,23 +89,23 @@ bool CudaPreprocessor::process(
         return false;
     }
 
-    prep.original_width = image.cols;
-    prep.original_height = image.rows;
+    if (config_.inputWidth <= 0 || config_.inputHeight <= 0) {
+        std::cerr << "[CUDA Preprocess] invalid input size" << std::endl;
+        return false;
+    }
 
-    float scale = std::min(
-        static_cast<float>(inputW_) / static_cast<float>(image.cols),
-        static_cast<float>(inputH_) / static_cast<float>(image.rows)
-    );
+    if (config_.std[0] == 0.0f || config_.std[1] == 0.0f || config_.std[2] == 0.0f) {
+        std::cerr << "[CUDA Preprocess] std values must be non-zero" << std::endl;
+        return false;
+    }
 
-    int resizedW = static_cast<int>(std::round(image.cols * scale));
-    int resizedH = static_cast<int>(std::round(image.rows * scale));
-
-    int padX = (inputW_ - resizedW) / 2;
-    int padY = (inputH_ - resizedH) / 2;
-
-    prep.scale = scale;
-    prep.pad_x = padX;
-    prep.pad_y = padY;
+    prep.originalWidth = image.cols;
+    prep.originalHeight = image.rows;
+    prep.inputWidth = config_.inputWidth;
+    prep.inputHeight = config_.inputHeight;
+    prep.scaleX = static_cast<float>(config_.inputWidth) / static_cast<float>(image.cols);
+    prep.scaleY = static_cast<float>(config_.inputHeight) / static_cast<float>(image.rows);
+    prep.blob.release();
 
     size_t imageBytes = image.step * image.rows;
 
@@ -131,12 +134,15 @@ bool CudaPreprocessor::process(
         image.rows,
         static_cast<int>(image.step),
         inputDevice,
-        inputW_,
-        inputH_,
+        config_.inputWidth,
+        config_.inputHeight,
         inputElementSize,
-        scale,
-        padX,
-        padY,
+        config_.mean[0],
+        config_.mean[1],
+        config_.mean[2],
+        config_.std[0],
+        config_.std[1],
+        config_.std[2],
         stream
     );
 

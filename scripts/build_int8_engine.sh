@@ -18,6 +18,7 @@ STD="${STD:-61.455,60.18,62.22}"
 CALIB_BATCH="${CALIB_BATCH:-1}"
 CALIB_MAX_IMAGES="${CALIB_MAX_IMAGES:-500}"
 WORKSPACE_MIB="${WORKSPACE_MIB:-2048}"
+FORCE_LAYERNORM_FP32="${FORCE_LAYERNORM_FP32:-1}"
 
 if [ ! -x "${BUILDER}" ]; then
     echo "[ERROR] builder not found: ${BUILDER}"
@@ -44,6 +45,7 @@ echo "[INFO] calib cache: ${CALIB_CACHE}"
     --calib_cache "${CALIB_CACHE}" \
     --calib_batch "${CALIB_BATCH}" \
     --calib_max_images "${CALIB_MAX_IMAGES}" \
-    --workspace_mib "${WORKSPACE_MIB}"
+    --workspace_mib "${WORKSPACE_MIB}" \
+    --force_layernorm_fp32 "${FORCE_LAYERNORM_FP32}"
 
 echo "[INFO] INT8 engine finished: ${ENGINE}"

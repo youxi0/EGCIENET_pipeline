@@ -1,22 +1,21 @@
 #pragma once
 
-#include "preprocess/Preprocessor.h"
+#include "common/PreprocessData.h"
 
-#include <opencv2/opencv.hpp>
 #include <cuda_runtime.h>
+#include <opencv2/core.hpp>
+
 #include <cstddef>
 
-//模块:CUDA前处理
-//作用:将CPU原图拷贝到GPU,并在GPU上完成letterbox、BGR转RGB、归一化、HWC转CHW
-//输出:直接写入TensorRT输入GPU buffer
 class CudaPreprocessor {
 public:
     CudaPreprocessor(int inputW, int inputH);
+    explicit CudaPreprocessor(PreprocessConfig config);
     ~CudaPreprocessor();
 
+    // 将 CPU 端 BGR 图像拷贝到 GPU，resize 到模型尺寸，归一化后写成 NCHW。
     bool process(
         const cv::Mat& image,
-        // 修改点: inputDevice可能是float*或half*，由inputElementSize决定写入格式。
         void* inputDevice,
         size_t inputElementSize,
         PreprocessResult& prep,
@@ -28,10 +27,7 @@ private:
     void release();
 
 private:
-    int inputW_ = 352;
-    int inputH_ = 352;
-
-   
+    PreprocessConfig config_;
     unsigned char* imageDevice_ = nullptr;
     size_t imageDeviceBytes_ = 0;
 };

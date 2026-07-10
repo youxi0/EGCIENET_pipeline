@@ -221,7 +221,7 @@ bool TensorRTInfer::allocateBuffers()
             if (hasDynamicDim(dims))
             {
                 nvinfer1::Dims4 inputDims(1, 3, 352, 352);
-                //模块:setBindingDimensions设置动态输入shape,这里固定为1x3x640x640
+                //模块:setBindingDimensions设置动态输入shape,这里固定为1x3x352x352
                 bool ok = context_->setBindingDimensions(i, inputDims); 
                 if (!ok)
                 {
@@ -339,7 +339,7 @@ std::vector<cv::Mat> TensorRTInfer::forward(const cv::Mat& blob)
 
     if (inputType == nvinfer1::DataType::kHALF)
     {
-        // Modified: convert CPU float blob to half for FP16 TensorRT input bindings.
+        // FP16输入binding需要把CPU端float blob转换成half。
         halfInput.resize(elementCount);
         const float* src = blob.ptr<float>();
 

@@ -7,6 +7,7 @@
 #include <NvOnnxParser.h>
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -16,6 +17,27 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+std::string toLowerAscii(std::string value) {
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
+    );
+    return value;
+}
+
+bool looksLikeLayerNormName(const std::string& layerName) {
+    const std::string lower = toLowerAscii(layerName);
+    return lower.find("layernorm") != std::string::npos ||
+           lower.find("layer_norm") != std::string::npos ||
+           lower.find("rmsnorm") != std::string::npos ||
+           lower.find("norm") != std::string::npos ||
+           lower.find("/ln") != std::string::npos ||
+           lower.find(".ln") != std::string::npos ||
+           lower.find("_ln") != std::string::npos;
+}
 
 std::string dimsToString(const nvinfer1::Dims& dims) {
     std::ostringstream oss;
@@ -40,7 +62,7 @@ void setWorkspaceSize(nvinfer1::IBuilderConfig& builderConfig, size_t workspaceS
 #endif
 }
 
-} // namespace
+} // 匿名命名空间
 
 EngineBuilder::EngineBuilder(EngineBuilderConfig config)
     : config_(std::move(config)) {}
@@ -114,6 +136,10 @@ bool EngineBuilder::build() {
     }
 
     setWorkspaceSize(*builderConfig, config_.workspaceSizeMiB);
+
+    if (!configureLayerPrecisions(*network, *builderConfig)) {
+        return false;
+    }
 
     std::vector<std::unique_ptr<nvinfer1::IOptimizationProfile, TrtDestroy<nvinfer1::IOptimizationProfile>>> profiles;
     if (!configureOptimizationProfile(*builder, *network, *builderConfig, profiles)) {
@@ -272,6 +298,61 @@ bool EngineBuilder::configurePrecision(
     std::ostringstream oss;
     oss << "[EngineBuilder] enable INT8, calibration_images=" << calibrator->imageCount()
         << ", cache=" << config_.calibrateCacheFile;
+    utils::FileLogger::instance().info(oss.str());
+    return true;
+}
+
+bool EngineBuilder::configureLayerPrecisions(
+    nvinfer1::INetworkDefinition& network,
+    nvinfer1::IBuilderConfig& builderConfig
+) {
+    if (config_.precision == EnginePrecision::kFP32 || !config_.forceLayerNormFp32) {
+        return true;
+    }
+
+    int forcedLayerCount = 0;
+    int forcedOutputCount = 0;
+
+    for (int i = 0; i < network.getNbLayers(); ++i) {
+        nvinfer1::ILayer* layer = network.getLayer(i);
+        if (layer == nullptr) {
+            continue;
+        }
+
+        const char* rawName = layer->getName();
+        const std::string layerName = rawName == nullptr ? "" : rawName;
+        if (!looksLikeLayerNormName(layerName)) {
+            continue;
+        }
+
+        layer->setPrecision(nvinfer1::DataType::kFLOAT);
+        ++forcedLayerCount;
+
+        for (int outputIndex = 0; outputIndex < layer->getNbOutputs(); ++outputIndex) {
+            if (layer->getOutput(outputIndex) != nullptr) {
+                layer->setOutputType(outputIndex, nvinfer1::DataType::kFLOAT);
+                ++forcedOutputCount;
+            }
+        }
+
+        utils::FileLogger::instance().info(
+            "[EngineBuilder] force FP32 for LayerNorm-like layer: " + layerName
+        );
+    }
+
+    if (forcedLayerCount == 0) {
+        utils::FileLogger::instance().warning(
+            "[EngineBuilder] force_layernorm_fp32 is enabled, but no LayerNorm-like layer names were matched"
+        );
+        return true;
+    }
+
+    builderConfig.setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
+
+    std::ostringstream oss;
+    oss << "[EngineBuilder] forced FP32 LayerNorm-like layers="
+        << forcedLayerCount
+        << ", outputs=" << forcedOutputCount;
     utils::FileLogger::instance().info(oss.str());
     return true;
 }

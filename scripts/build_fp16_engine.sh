@@ -14,6 +14,7 @@ INPUT_H="${INPUT_H:-352}"
 MEAN="${MEAN:-140.505,157.845,135.66}"
 STD="${STD:-61.455,60.18,62.22}"
 WORKSPACE_MIB="${WORKSPACE_MIB:-2048}"
+FORCE_LAYERNORM_FP32="${FORCE_LAYERNORM_FP32:-1}"
 
 if [ ! -x "${BUILDER}" ]; then
     echo "[ERROR] builder not found: ${BUILDER}"
@@ -34,6 +35,7 @@ echo "[INFO] engine: ${ENGINE}"
     --input_h "${INPUT_H}" \
     --mean "${MEAN}" \
     --std "${STD}" \
-    --workspace_mib "${WORKSPACE_MIB}"
+    --workspace_mib "${WORKSPACE_MIB}" \
+    --force_layernorm_fp32 "${FORCE_LAYERNORM_FP32}"
 
 echo "[INFO] FP16 engine finished: ${ENGINE}"

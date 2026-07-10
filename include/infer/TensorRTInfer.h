@@ -11,22 +11,22 @@
 #include <string>
 #include <vector>
 
-// Runtime wrapper for loading a serialized TensorRT engine and executing inference.
+// TensorRT 运行时封装：加载序列化 engine 并执行推理。
 class TensorRTInfer {
 public:
     explicit TensorRTInfer(const std::string& enginePath);
     ~TensorRTInfer();
 
-    // Loads runtime, deserializes engine, creates execution context, and allocates bindings.
+    // 加载 runtime，反序列化 engine，创建执行上下文并分配 binding buffer。
     bool load();
 
-    // Copies a CPU FP32 NCHW blob to the input binding, runs inference, and copies outputs back.
+    // 将 CPU 端 FP32 NCHW blob 拷贝到输入 binding，执行推理并拷回输出。
     std::vector<cv::Mat> forward(const cv::Mat& blob);
 
-    // Runs inference when the input binding has already been filled on device.
+    // 输入 binding 已由 GPU 预处理写好时，直接执行推理。
     std::vector<cv::Mat> forwardFromDevice();
 
-    // Returns the TensorRT input device buffer for GPU-side preprocessing.
+    // 返回 TensorRT 输入端 device buffer，供 GPU 预处理直接写入。
     void* inputDeviceBuffer();
 
     nvinfer1::DataType inputDataType() const;
