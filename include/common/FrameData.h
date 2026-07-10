@@ -7,7 +7,6 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 struct FrameCost {
     double acquire_ms = 0.0;
@@ -28,8 +27,8 @@ struct FrameData {
     // CPU/CUDA 预处理和后处理共享的 resize/归一化元信息。
     PreprocessResult prep;
 
-    // TensorRT 原始输出张量；EGCINET 当前输出一个 [1, 1, 352, 352] mask。
-    std::vector<cv::Mat> outputs;
+    // TensorRT 输出的模型尺度 FP32 概率图，形状为 352x352。
+    cv::Mat modelMask;
 
     // 后处理结果，用于部署输出或调试保存。
     cv::Mat probabilityMask;
@@ -39,7 +38,7 @@ struct FrameData {
 
     void releaseTransient() {
         prep.blob.release();
-        outputs.clear();
+        modelMask.release();
     }
 };
 

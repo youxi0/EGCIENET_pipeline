@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 
 #include <iostream>
+#include <limits>
 
 void launchPreprocessKernel(
     const unsigned char* src,
@@ -63,6 +64,7 @@ bool CudaPreprocessor::ensureImageBuffer(size_t bytes) {
 bool CudaPreprocessor::process(
     const cv::Mat& image,
     void* inputDevice,
+    size_t inputBufferBytes,
     size_t inputElementSize,
     PreprocessResult& prep,
     cudaStream_t stream
@@ -77,7 +79,7 @@ bool CudaPreprocessor::process(
         return false;
     }
 
-    // 修改点: 当前CUDA预处理只支持写FP32或FP16输入，防止INT8输入被误写成float。
+    // 当前 CUDA 预处理只支持写 FP32 或 FP16 输入，防止误写 INT8 binding。
     if (inputElementSize != sizeof(float) && inputElementSize != sizeof(__half)) {
         std::cerr << "[CUDA Preprocess] unsupported TensorRT input element size: "
                   << inputElementSize << std::endl;
@@ -91,6 +93,22 @@ bool CudaPreprocessor::process(
 
     if (config_.inputWidth <= 0 || config_.inputHeight <= 0) {
         std::cerr << "[CUDA Preprocess] invalid input size" << std::endl;
+        return false;
+    }
+
+    const size_t inputPixels =
+        static_cast<size_t>(config_.inputWidth) * static_cast<size_t>(config_.inputHeight);
+
+    if (inputPixels > std::numeric_limits<size_t>::max() / 3 ||
+        inputPixels * 3 > std::numeric_limits<size_t>::max() / inputElementSize) {
+        std::cerr << "[CUDA Preprocess] input buffer size overflow" << std::endl;
+        return false;
+    }
+
+    const size_t requiredInputBytes = inputPixels * 3 * inputElementSize;
+    if (requiredInputBytes > inputBufferBytes) {
+        std::cerr << "[CUDA Preprocess] TensorRT input buffer is too small: required="
+                  << requiredInputBytes << ", capacity=" << inputBufferBytes << std::endl;
         return false;
     }
 

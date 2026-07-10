@@ -1,5 +1,5 @@
 #include "pipeline/InspectionPipeline.h"
-#include "common/ScopeTimer.h"
+#include "common/Timer.h"
 #include "utils/FileLogger.h"
 #include "utils/Int8CompareSaver.h"
 
@@ -169,6 +169,8 @@ void InspectionPipeline::captureLoop() {
 void InspectionPipeline::preprocessLoop() {
     auto& logger = utils::FileLogger::instance();
     Preprocessor preprocessor(config_.inputWidth, config_.inputHeight);
+    CpuTimer timer;
+
     while (running_) {
         FrameData task;
 
@@ -176,7 +178,7 @@ void InspectionPipeline::preprocessLoop() {
             break;
         }     
         // 前处理 
-        ScopeTimer timer;
+        timer.reset();
         task.prep = preprocessor.process(task.originalImage);
         task.cost.preprocess_ms = timer.elapsedMs();
         task.cost.total_ms += task.cost.preprocess_ms;   
@@ -213,7 +215,17 @@ void InspectionPipeline::gpuInferLoop() {
     }
     
     logger.info("[GPU] TensorRT engine loaded");
-    CudaPreprocessor cudaPreprocessor(config_.inputWidth, config_.inputHeight);
+    CudaPreprocessor cudaPreprocessor(infer.inputWidth(), infer.inputHeight());
+    CudaEventTimer preprocessTimer(infer.stream());
+    CudaEventTimer inferTimer(infer.stream());
+
+    if (!preprocessTimer.isValid() || !inferTimer.isValid()) {
+        logger.error("[GPU] failed to create CUDA event timer");
+        running_ = false;
+        rawQueue_.stop();
+        inferQueue_.stop();
+        return;
+    }
 
     while (running_) {
         FrameData task;
@@ -235,29 +247,45 @@ void InspectionPipeline::gpuInferLoop() {
         #endif
         ///////////////////////// test
         PreprocessResult prep;
-        ScopeTimer timer; 
-        bool ok = cudaPreprocessor.process(
+        if (!preprocessTimer.start()) {
+            logger.error("[GPU] failed to start CUDA preprocess timer");
+            continue;
+        }
+
+        const bool preprocessOk = cudaPreprocessor.process(
             task.originalImage,
             infer.inputDeviceBuffer(),
+            infer.inputBufferBytes(),
             infer.inputElementSize(),
             prep,
             infer.stream()
         );
-        task.cost.preprocess_ms = timer.elapsedMs();
-        task.cost.total_ms += task.cost.preprocess_ms;
 
-        if (!ok) {
+        const bool preprocessTimerStopped = preprocessTimer.stop();
+        if (!preprocessTimerStopped || !preprocessOk) {
+            if (preprocessTimerStopped) {
+                preprocessTimer.elapsedMs();
+            }
             std::cerr << "[GPU] cuda preprocess failed, frameId="<< task.frameId<< std::endl;
             logger.error("[GPU] cuda preprocess failed, frameId=" + std::to_string(task.frameId));
             continue;
         }
 
-        timer.reset();
-        auto outputs = infer.forwardFromDevice();
-        task.cost.infer_ms = timer.elapsedMs();
+        if (!inferTimer.start()) {
+            preprocessTimer.elapsedMs();
+            logger.error("[GPU] failed to start CUDA inference timer");
+            continue;
+        }
+
+        const bool inferOk = infer.inferFromDevice(task.modelMask);
+        const bool inferTimerOk = inferTimer.stop();
+
+        task.cost.preprocess_ms = preprocessTimer.elapsedMs();
+        task.cost.infer_ms = inferTimerOk ? inferTimer.elapsedMs() : -1.0;
+        task.cost.total_ms += task.cost.preprocess_ms;
         task.cost.total_ms += task.cost.infer_ms;
 
-        if (outputs.empty()) {
+        if (!inferOk || task.modelMask.empty() || task.cost.infer_ms < 0.0) {
             std::cerr << "[GPU] TensorRT output empty, frameId="
                       << task.frameId
                       << std::endl;
@@ -266,7 +294,6 @@ void InspectionPipeline::gpuInferLoop() {
         }
         
         task.prep = std::move(prep);
-        task.outputs = std::move(outputs);     
         
         if (!inferQueue_.push(std::move(task))) {
             break;
@@ -288,6 +315,8 @@ void InspectionPipeline::postprocessLoop() {
         // BaselineSaver只负责把FP16结果落盘留档；INT8对比线程不依赖这些文件。
         baselineSaver = std::make_unique<utils::BaselineSaver>(config_.baselineDir);
     }
+    CpuTimer timer;
+
     while (running_) {
         FrameData processed;
 
@@ -295,7 +324,7 @@ void InspectionPipeline::postprocessLoop() {
             break;
         }        
         //后处理
-        ScopeTimer timer;
+        timer.reset();
         processed.results = postprocessor.process(processed.outputs, processed.prep, config_.classNames);
         processed.cost.postprocess_ms = timer.elapsedMs();
         processed.cost.total_ms += processed.cost.postprocess_ms;
@@ -361,8 +390,17 @@ void InspectionPipeline::int8CompareLoop() {
 
     logger.info("[INT8 Compare] TensorRT INT8 engine loaded");
 
-    CudaPreprocessor cudaPreprocessor(config_.inputWidth, config_.inputHeight);
-    Preprocessor cpuPreprocessor(config_.inputWidth, config_.inputHeight);
+    CudaPreprocessor cudaPreprocessor(int8Infer.inputWidth(), int8Infer.inputHeight());
+    Preprocessor cpuPreprocessor(int8Infer.inputWidth(), int8Infer.inputHeight());
+    CudaEventTimer preprocessTimer(int8Infer.stream());
+    CudaEventTimer inferTimer(int8Infer.stream());
+    CpuTimer cpuTimer;
+
+    if (!preprocessTimer.isValid() || !inferTimer.isValid()) {
+        logger.error("[INT8 Compare] failed to create CUDA event timer");
+        return;
+    }
+
     SegPostprocessor postprocessor(config_.confThreshold, config_.nmsThreshold, config_.maskThreshold);
 
     utils::Int8CompareConfig compareConfig;
@@ -383,32 +421,34 @@ void InspectionPipeline::int8CompareLoop() {
         int8Frame.source_path = fp16Frame.source_path;
         int8Frame.originalImage = fp16Frame.originalImage;
 
-        ScopeTimer timer;
-
         // 第一步：预处理。主流程使用CUDA预处理时，INT8对比线程也走同一条CUDA路径。
         if (config_.useCudaPreprocess) {
+            if (!preprocessTimer.start()) {
+                logger.error("[INT8 Compare] failed to start CUDA preprocess timer");
+                continue;
+            }
+
             bool ok = cudaPreprocessor.process(
                 int8Frame.originalImage,
                 int8Infer.inputDeviceBuffer(),
+                int8Infer.inputBufferBytes(),
                 int8Infer.inputElementSize(),
                 int8Frame.prep,
                 int8Infer.stream()
             );
 
-            int8Frame.cost.preprocess_ms = timer.elapsedMs();
-            int8Frame.cost.total_ms += int8Frame.cost.preprocess_ms;
-
-            if (!ok) {
+            const bool preprocessTimerStopped = preprocessTimer.stop();
+            if (!preprocessTimerStopped || !ok) {
+                if (preprocessTimerStopped) {
+                    preprocessTimer.elapsedMs();
+                }
                 logger.error("[INT8 Compare] cuda preprocess failed, frameId=" + std::to_string(fp16Frame.frameId));
                 continue;
             }
-
-            // 第二步：推理。输入已经写到TensorRT input buffer，直接enqueue。
-            timer.reset();
-            int8Frame.outputs = int8Infer.forwardFromDevice();
         } else {
+            cpuTimer.reset();
             int8Frame.prep = cpuPreprocessor.process(int8Frame.originalImage);
-            int8Frame.cost.preprocess_ms = timer.elapsedMs();
+            int8Frame.cost.preprocess_ms = cpuTimer.elapsedMs();
             int8Frame.cost.total_ms += int8Frame.cost.preprocess_ms;
 
             if (int8Frame.prep.blob.empty()) {
@@ -416,23 +456,39 @@ void InspectionPipeline::int8CompareLoop() {
                 continue;
             }
 
-            // 第二步：推理。CPU预处理路径由forward()完成H2D、TensorRT、D2H。
-            timer.reset();
-            int8Frame.outputs = int8Infer.forward(int8Frame.prep.blob);
         }
 
-        int8Frame.cost.infer_ms = timer.elapsedMs();
+        // 第二步：无论输入来自 CPU 还是 CUDA，GPU 推理都使用 CUDA Event 计时。
+        if (!inferTimer.start()) {
+            if (config_.useCudaPreprocess) {
+                preprocessTimer.elapsedMs();
+            }
+            logger.error("[INT8 Compare] failed to start CUDA inference timer");
+            continue;
+        }
+
+        const bool inferOk = config_.useCudaPreprocess
+            ? int8Infer.inferFromDevice(int8Frame.modelMask)
+            : int8Infer.infer(int8Frame.prep.blob, int8Frame.modelMask);
+
+        const bool inferTimerOk = inferTimer.stop();
+        if (config_.useCudaPreprocess) {
+            int8Frame.cost.preprocess_ms = preprocessTimer.elapsedMs();
+            int8Frame.cost.total_ms += int8Frame.cost.preprocess_ms;
+        }
+
+        int8Frame.cost.infer_ms = inferTimerOk ? inferTimer.elapsedMs() : -1.0;
         int8Frame.cost.total_ms += int8Frame.cost.infer_ms;
 
-        if (int8Frame.outputs.empty()) {
+        if (!inferOk || int8Frame.modelMask.empty() || int8Frame.cost.infer_ms < 0.0) {
             logger.error("[INT8 Compare] TensorRT output empty, frameId=" + std::to_string(fp16Frame.frameId));
             continue;
         }
 
         // 第三步：后处理。阈值和类别名与FP16 baseline完全一致，只比较engine差异。
-        timer.reset();
+        cpuTimer.reset();
         int8Frame.results = postprocessor.process(int8Frame.outputs, int8Frame.prep, config_.classNames);
-        int8Frame.cost.postprocess_ms = timer.elapsedMs();
+        int8Frame.cost.postprocess_ms = cpuTimer.elapsedMs();
         int8Frame.cost.total_ms += int8Frame.cost.postprocess_ms;
 
         // 第四步：保存逐帧对比指标和最终summary。
@@ -545,6 +601,7 @@ bool InspectionPipeline::compareCpuCudaPreprocess(
     bool ok = cudaPreprocessor.process(
         image,
         infer.inputDeviceBuffer(),
+        infer.inputBufferBytes(),
         infer.inputElementSize(),
         cudaPrep,
         infer.stream()
