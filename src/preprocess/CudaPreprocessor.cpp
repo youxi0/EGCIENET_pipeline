@@ -39,6 +39,10 @@ void CudaPreprocessor::release() {
         imageDevice_ = nullptr;
         imageDeviceBytes_ = 0;
     }
+
+    imageDeviceStep_ = 0;
+    imageWidth_ = 0;
+    imageHeight_ = 0;
 }
 
 bool CudaPreprocessor::ensureImageBuffer(size_t bytes) {
@@ -69,6 +73,10 @@ bool CudaPreprocessor::process(
     PreprocessResult& prep,
     cudaStream_t stream
 ) {
+    imageDeviceStep_ = 0;
+    imageWidth_ = 0;
+    imageHeight_ = 0;
+
     if (image.empty()) {
         std::cerr << "[CUDA Preprocess] input image is empty" << std::endl;
         return false;
@@ -125,22 +133,37 @@ bool CudaPreprocessor::process(
     prep.scaleY = static_cast<float>(config_.inputHeight) / static_cast<float>(image.rows);
     prep.blob.release();
 
-    size_t imageBytes = image.step * image.rows;
+    if (image.cols > std::numeric_limits<int>::max() / 3) {
+        std::cerr << "[CUDA Preprocess] image row is too large" << std::endl;
+        return false;
+    }
+
+    const size_t packedStep = static_cast<size_t>(image.cols) * 3;
+    if (image.step < packedStep ||
+        static_cast<size_t>(image.rows) > std::numeric_limits<size_t>::max() / packedStep) {
+        std::cerr << "[CUDA Preprocess] invalid image step or size" << std::endl;
+        return false;
+    }
+
+    const size_t imageBytes = packedStep * static_cast<size_t>(image.rows);
 
     if (!ensureImageBuffer(imageBytes)) {
         return false;
     }
 
-    cudaError_t err = cudaMemcpyAsync(
+    cudaError_t err = cudaMemcpy2DAsync(
         imageDevice_,
+        packedStep,
         image.data,
-        imageBytes,
+        image.step,
+        packedStep,
+        static_cast<size_t>(image.rows),
         cudaMemcpyHostToDevice,
         stream
     );
 
     if (err != cudaSuccess) {
-        std::cerr << "[CUDA Preprocess] cudaMemcpyAsync H2D failed: "
+        std::cerr << "[CUDA Preprocess] cudaMemcpy2DAsync H2D failed: "
                   << cudaGetErrorString(err)
                   << std::endl;
         return false;
@@ -150,7 +173,7 @@ bool CudaPreprocessor::process(
         imageDevice_,
         image.cols,
         image.rows,
-        static_cast<int>(image.step),
+        static_cast<int>(packedStep),
         inputDevice,
         config_.inputWidth,
         config_.inputHeight,
@@ -173,5 +196,25 @@ bool CudaPreprocessor::process(
         return false;
     }
 
+    imageDeviceStep_ = packedStep;
+    imageWidth_ = image.cols;
+    imageHeight_ = image.rows;
+
     return true;
+}
+
+unsigned char* CudaPreprocessor::imageDeviceBuffer() noexcept {
+    return imageDevice_;
+}
+
+size_t CudaPreprocessor::imageDeviceStep() const noexcept {
+    return imageDeviceStep_;
+}
+
+int CudaPreprocessor::imageWidth() const noexcept {
+    return imageWidth_;
+}
+
+int CudaPreprocessor::imageHeight() const noexcept {
+    return imageHeight_;
 }

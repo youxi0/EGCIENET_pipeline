@@ -252,9 +252,8 @@ bool TensorRTInfer::allocateDeviceBuffers() {
     return true;
 }
 
-bool TensorRTInfer::infer(const cv::Mat& inputBlob, cv::Mat& modelMask) {
+bool TensorRTInfer::infer(const cv::Mat& inputBlob) {
     if (!validateInputBlob(inputBlob)) {
-        modelMask.release();
         return false;
     }
 
@@ -279,22 +278,20 @@ bool TensorRTInfer::infer(const cv::Mat& inputBlob, cv::Mat& modelMask) {
                 stream_
             ),
             "cudaMemcpyAsync input H2D")) {
-        modelMask.release();
         return false;
     }
 
-    return enqueueAndCopyOutput(modelMask);
+    return enqueue();
 }
 
-bool TensorRTInfer::inferFromDevice(cv::Mat& modelMask) {
+bool TensorRTInfer::inferFromDevice() {
     if (!isLoaded() || deviceBuffers_[input_.index] == nullptr) {
         std::cerr << "[TensorRT Infer] engine is not loaded" << std::endl;
-        modelMask.release();
         return false;
     }
 
     // 预处理与推理共用同一个 CUDA 流，enqueue 会自然等待前面的预处理完成。
-    return enqueueAndCopyOutput(modelMask);
+    return enqueue();
 }
 
 bool TensorRTInfer::validateInputBlob(const cv::Mat& inputBlob) const {
@@ -319,57 +316,10 @@ bool TensorRTInfer::validateInputBlob(const cv::Mat& inputBlob) const {
     return true;
 }
 
-bool TensorRTInfer::enqueueAndCopyOutput(cv::Mat& modelMask) {
+bool TensorRTInfer::enqueue() {
     if (!context_->enqueueV2(deviceBuffers_.data(), stream_, nullptr)) {
         std::cerr << "[TensorRT Infer] enqueueV2 failed" << std::endl;
-        modelMask.release();
         return false;
-    }
-
-    return copyOutputToHost(modelMask);
-}
-
-bool TensorRTInfer::copyOutputToHost(cv::Mat& modelMask) {
-    const int outputHeight = output_.dims.d[2];
-    const int outputWidth = output_.dims.d[3];
-    modelMask.create(outputHeight, outputWidth, CV_32F);
-
-    if (output_.dataType == nvinfer1::DataType::kFLOAT) {
-        if (!checkCuda(
-                cudaMemcpyAsync(
-                    modelMask.ptr<float>(),
-                    deviceBuffers_[output_.index],
-                    output_.bytes,
-                    cudaMemcpyDeviceToHost,
-                    stream_
-                ),
-                "cudaMemcpyAsync output D2H") ||
-            !checkCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize")) {
-            modelMask.release();
-            return false;
-        }
-        return true;
-    }
-
-    hostOutputScratch_.resize(output_.elementCount);
-    if (!checkCuda(
-            cudaMemcpyAsync(
-                hostOutputScratch_.data(),
-                deviceBuffers_[output_.index],
-                output_.bytes,
-                cudaMemcpyDeviceToHost,
-                stream_
-            ),
-            "cudaMemcpyAsync FP16 output D2H") ||
-        !checkCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize")) {
-        modelMask.release();
-        return false;
-    }
-
-    const __half* halfOutput = hostOutputScratch_.data();
-    float* floatOutput = modelMask.ptr<float>();
-    for (size_t index = 0; index < output_.elementCount; ++index) {
-        floatOutput[index] = __half2float(halfOutput[index]);
     }
 
     return true;
@@ -402,6 +352,33 @@ int TensorRTInfer::inputHeight() const noexcept {
     return isLoaded() ? input_.dims.d[2] : 0;
 }
 
+const void* TensorRTInfer::outputDeviceBuffer() const noexcept {
+    if (!isLoaded() || output_.index >= static_cast<int>(deviceBuffers_.size())) {
+        return nullptr;
+    }
+    return deviceBuffers_[output_.index];
+}
+
+size_t TensorRTInfer::outputBufferBytes() const noexcept {
+    return isLoaded() ? output_.bytes : 0;
+}
+
+nvinfer1::DataType TensorRTInfer::outputDataType() const noexcept {
+    return isLoaded() ? output_.dataType : nvinfer1::DataType::kFLOAT;
+}
+
+size_t TensorRTInfer::outputElementSize() const noexcept {
+    return isLoaded() ? elementSize(output_.dataType) : 0;
+}
+
+int TensorRTInfer::outputWidth() const noexcept {
+    return isLoaded() ? output_.dims.d[3] : 0;
+}
+
+int TensorRTInfer::outputHeight() const noexcept {
+    return isLoaded() ? output_.dims.d[2] : 0;
+}
+
 cudaStream_t TensorRTInfer::stream() const noexcept {
     return stream_;
 }
@@ -426,7 +403,6 @@ void TensorRTInfer::release() noexcept {
     input_ = BindingInfo{};
     output_ = BindingInfo{};
     hostInputScratch_.clear();
-    hostOutputScratch_.clear();
 }
 
 void TensorRTInfer::releaseDeviceBuffers() noexcept {

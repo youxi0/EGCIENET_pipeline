@@ -24,6 +24,12 @@ public:
         cudaStream_t stream
     );
 
+    // 返回最近一帧上传后的紧凑 BGR 设备缓冲区，供 GPU 可视化原地使用。
+    unsigned char* imageDeviceBuffer() noexcept;
+    size_t imageDeviceStep() const noexcept;
+    int imageWidth() const noexcept;
+    int imageHeight() const noexcept;
+
 private:
     bool ensureImageBuffer(size_t bytes);
     void release();
@@ -32,4 +38,7 @@ private:
     PreprocessConfig config_;
     unsigned char* imageDevice_ = nullptr;
     size_t imageDeviceBytes_ = 0;
+    size_t imageDeviceStep_ = 0;
+    int imageWidth_ = 0;
+    int imageHeight_ = 0;
 };

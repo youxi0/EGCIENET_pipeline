@@ -94,9 +94,13 @@ if(EGCINET_BUILD_PIPELINE)
         src/common/Timer.cpp
         src/infer/TensorRTCommon.cpp
         src/infer/TensorRTInfer.cpp
+        src/postprocess/SegPostprocessor.cpp
+        src/postprocess/SegPostprocessKernel.cu
         src/preprocess/CudaPreprocessor.cpp
         src/preprocess/CudaPreprocessKernel.cu
         src/utils/FileLogger.cpp
+        src/visualize/Visualizer.cpp
+        src/visualize/VisualizeKernel.cu
     )
 
     target_include_directories(egcinet_runtime PUBLIC

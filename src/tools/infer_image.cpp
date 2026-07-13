@@ -1,7 +1,9 @@
 #include "common/PreprocessData.h"
 #include "common/Timer.h"
 #include "infer/TensorRTInfer.h"
+#include "postprocess/SegPostprocessor.h"
 #include "preprocess/CudaPreprocessor.h"
+#include "visualize/Visualizer.h"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -32,7 +34,9 @@ void printUsage(const char* application) {
               << "  " << application
               << " --engine models/egcinet_fp16.engine"
               << " --image data/test.jpg"
-              << " [--output mask.png]\n";
+              << " [--output mask.png]"
+              << " [--probability probability.png]"
+              << " [--visualized visualized.png]\n";
 }
 
 } // namespace
@@ -41,6 +45,10 @@ int main(int argc, char** argv) {
     const std::string enginePath = getArgument(argc, argv, "--engine");
     const std::string imagePath = getArgument(argc, argv, "--image");
     const std::string outputPath = getArgument(argc, argv, "--output", "mask.png");
+    const std::string probabilityPath =
+        getArgument(argc, argv, "--probability", "probability.png");
+    const std::string visualizedPath =
+        getArgument(argc, argv, "--visualized", "visualized.png");
 
     if (enginePath.empty() || imagePath.empty()) {
         printUsage(argv[0]);
@@ -60,9 +68,16 @@ int main(int argc, char** argv) {
 
     // 预处理尺寸直接取自 engine，避免配置值与 binding 尺寸不一致。
     CudaPreprocessor preprocessor(infer.inputWidth(), infer.inputHeight());
+    SegPostprocessor postprocessor;
+    Visualizer visualizer;
     CudaEventTimer preprocessTimer(infer.stream());
     CudaEventTimer inferTimer(infer.stream());
-    if (!preprocessTimer.isValid() || !inferTimer.isValid()) {
+    CudaEventTimer postprocessTimer(infer.stream());
+    CudaEventTimer visualizeTimer(infer.stream());
+    CudaEventTimer d2hTimer(infer.stream());
+    if (!preprocessTimer.isValid() || !inferTimer.isValid() ||
+        !postprocessTimer.isValid() || !visualizeTimer.isValid() ||
+        !d2hTimer.isValid()) {
         return 4;
     }
 
@@ -91,8 +106,7 @@ int main(int argc, char** argv) {
         return 5;
     }
 
-    cv::Mat modelMask;
-    const bool inferOk = infer.inferFromDevice(modelMask);
+    const bool inferOk = infer.inferFromDevice();
     const bool inferTimerStopped = inferTimer.stop();
     if (!inferTimerStopped || !inferOk) {
         if (inferTimerStopped) {
@@ -101,32 +115,115 @@ int main(int argc, char** argv) {
         return 6;
     }
 
+    if (!postprocessTimer.start()) {
+        return 6;
+    }
+
+    const bool postprocessOk = postprocessor.process(
+        infer.outputDeviceBuffer(),
+        infer.outputBufferBytes(),
+        infer.outputElementSize(),
+        infer.outputWidth(),
+        infer.outputHeight(),
+        image.cols,
+        image.rows,
+        infer.stream()
+    );
+    const bool postprocessTimerStopped = postprocessTimer.stop();
+    if (!postprocessTimerStopped || !postprocessOk) {
+        return 7;
+    }
+
+    if (!visualizeTimer.start()) {
+        return 7;
+    }
+
+    const bool visualizeOk = visualizer.process(
+        preprocessor.imageDeviceBuffer(),
+        preprocessor.imageDeviceStep(),
+        preprocessor.imageWidth(),
+        preprocessor.imageHeight(),
+        postprocessor.probabilityDeviceBuffer(),
+        postprocessor.binaryDeviceBuffer(),
+        infer.stream()
+    );
+    const bool visualizeTimerStopped = visualizeTimer.stop();
+    if (!visualizeTimerStopped || !visualizeOk) {
+        return 8;
+    }
+
+    // 所有 GPU 计算都已排入同一 stream，最后统一排队 D2H 并同步一次。
+    if (!d2hTimer.start()) {
+        return 8;
+    }
+
+    cv::Mat probabilityMask;
+    cv::Mat binaryMask;
+    cv::Mat visualizedImage;
+    const bool masksDownloadOk = postprocessor.enqueueDownload(
+        probabilityMask,
+        binaryMask,
+        infer.stream()
+    );
+    const bool imageDownloadOk = visualizer.enqueueDownload(
+        preprocessor.imageDeviceBuffer(),
+        preprocessor.imageDeviceStep(),
+        preprocessor.imageWidth(),
+        preprocessor.imageHeight(),
+        visualizedImage,
+        infer.stream()
+    );
+    const bool d2hTimerStopped = d2hTimer.stop();
+    const cudaError_t syncStatus = cudaStreamSynchronize(infer.stream());
+
+    if (!masksDownloadOk || !imageDownloadOk || !d2hTimerStopped ||
+        syncStatus != cudaSuccess) {
+        std::cerr << "[Infer Image] final D2H failed";
+        if (syncStatus != cudaSuccess) {
+            std::cerr << ": " << cudaGetErrorString(syncStatus);
+        }
+        std::cerr << std::endl;
+        return 9;
+    }
+
     const double preprocessGpuMs = preprocessTimer.elapsedMs();
     const double inferGpuMs = inferTimer.elapsedMs();
-    if (preprocessGpuMs < 0.0 || inferGpuMs < 0.0) {
-        return 6;
+    const double postprocessGpuMs = postprocessTimer.elapsedMs();
+    const double visualizeGpuMs = visualizeTimer.elapsedMs();
+    const double d2hMs = d2hTimer.elapsedMs();
+    if (preprocessGpuMs < 0.0 || inferGpuMs < 0.0 ||
+        postprocessGpuMs < 0.0 || visualizeGpuMs < 0.0 || d2hMs < 0.0) {
+        return 9;
     }
 
     double minimum = 0.0;
     double maximum = 0.0;
-    cv::minMaxLoc(modelMask, &minimum, &maximum);
+    cv::minMaxLoc(probabilityMask, &minimum, &maximum);
 
-    // PNG 使用 8 位灰度保存；convertTo 会把范围外的值饱和到 0 或 255。
-    cv::Mat maskImage;
-    modelMask.convertTo(maskImage, CV_8U, 255.0);
-    if (!cv::imwrite(outputPath, maskImage)) {
+    cv::Mat probabilityImage;
+    probabilityMask.convertTo(probabilityImage, CV_8U, 255.0);
+    if (!cv::imwrite(outputPath, binaryMask) ||
+        !cv::imwrite(probabilityPath, probabilityImage) ||
+        !cv::imwrite(visualizedPath, visualizedImage)) {
         std::cerr << "[Infer Image] failed to write mask: " << outputPath << std::endl;
-        return 7;
+        return 10;
     }
 
     std::cout << "[Infer Image] mask shape: "
-              << modelMask.cols << 'x' << modelMask.rows << std::endl;
+              << probabilityMask.cols << 'x' << probabilityMask.rows << std::endl;
     std::cout << "[Infer Image] probability range: ["
               << minimum << ", " << maximum << "]" << std::endl;
     std::cout << "[Infer Image] preprocess_gpu_ms: "
               << preprocessGpuMs << std::endl;
     std::cout << "[Infer Image] infer_gpu_ms: "
               << inferGpuMs << std::endl;
-    std::cout << "[Infer Image] saved: " << outputPath << std::endl;
+    std::cout << "[Infer Image] postprocess_gpu_ms: "
+              << postprocessGpuMs << std::endl;
+    std::cout << "[Infer Image] visualize_gpu_ms: "
+              << visualizeGpuMs << std::endl;
+    std::cout << "[Infer Image] d2h_ms: " << d2hMs << std::endl;
+    std::cout << "[Infer Image] saved binary mask: " << outputPath << std::endl;
+    std::cout << "[Infer Image] saved probability mask: " << probabilityPath << std::endl;
+    std::cout << "[Infer Image] saved visualization: " << visualizedPath << std::endl;
     return 0;
 }

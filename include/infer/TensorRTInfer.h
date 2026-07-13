@@ -37,11 +37,11 @@ public:
     bool load();
     bool isLoaded() const noexcept;
 
-    // CPU 路径：输入必须是连续的 FP32 NCHW blob，输出为 HxW FP32 概率图。
-    bool infer(const cv::Mat& inputBlob, cv::Mat& modelMask);
+    // CPU 路径：上传连续的 FP32 NCHW blob，然后异步提交推理。
+    bool infer(const cv::Mat& inputBlob);
 
-    // CUDA 预处理已在本实例的 stream 上写入输入显存时，直接执行推理。
-    bool inferFromDevice(cv::Mat& modelMask);
+    // CUDA 预处理已在本实例的 stream 上写入输入显存时，异步提交推理。
+    bool inferFromDevice();
 
     // CUDA 预处理模块通过以下接口直接写入 TensorRT 输入显存。
     void* inputDeviceBuffer() noexcept;
@@ -50,6 +50,15 @@ public:
     size_t inputElementSize() const noexcept;
     int inputWidth() const noexcept;
     int inputHeight() const noexcept;
+
+    // 后处理模块通过以下接口直接读取 TensorRT 输出显存。
+    const void* outputDeviceBuffer() const noexcept;
+    size_t outputBufferBytes() const noexcept;
+    nvinfer1::DataType outputDataType() const noexcept;
+    size_t outputElementSize() const noexcept;
+    int outputWidth() const noexcept;
+    int outputHeight() const noexcept;
+
     cudaStream_t stream() const noexcept;
 
 private:
@@ -78,9 +87,8 @@ private:
     // 校验 CPU blob 的数据类型、内存连续性和 NCHW 形状。
     bool validateInputBlob(const cv::Mat& inputBlob) const;
 
-    // 提交 TensorRT 推理，并把单个 mask 输出拷回主机。
-    bool enqueueAndCopyOutput(cv::Mat& modelMask);
-    bool copyOutputToHost(cv::Mat& modelMask);
+    // 只提交 TensorRT 推理，输出保留在 output binding 显存中。
+    bool enqueue();
 
     // 按 CUDA、TensorRT 的依赖顺序释放运行时资源。
     void release() noexcept;
@@ -105,7 +113,6 @@ private:
     BindingInfo output_;
     std::vector<void*> deviceBuffers_;
 
-    // FP16 I/O 转换使用可复用暂存区，避免每帧反复申请内存。
+    // CPU 路径的 FP16 输入转换使用可复用暂存区。
     std::vector<__half> hostInputScratch_;
-    std::vector<__half> hostOutputScratch_;
 };
