@@ -17,6 +17,7 @@ results/
 # Local datasets and large model files
 data/
 datasets/
+build-debug/
 Dataset/
 models/
 runs/
