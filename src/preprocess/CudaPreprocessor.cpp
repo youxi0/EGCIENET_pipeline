@@ -52,7 +52,7 @@ bool CudaPreprocessor::ensureImageBuffer(size_t bytes) {
 
     release();
 
-    cudaError_t err = cudaMalloc(&imageDevice_, bytes);
+    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&imageDevice_), bytes);
 
     if (err != cudaSuccess) {
         std::cerr << "[CUDA Preprocess] cudaMalloc image buffer failed: "

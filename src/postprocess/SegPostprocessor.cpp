@@ -200,14 +200,20 @@ bool SegPostprocessor::ensureOutputBuffers(size_t pixelCount) {
     }
 
     if (!checkCuda(
-            cudaMalloc(&probabilityDevice_, pixelCount * sizeof(float)),
+            cudaMalloc(
+                reinterpret_cast<void**>(&probabilityDevice_),
+                pixelCount * sizeof(float)
+            ),
             "cudaMalloc probability mask")) {
         release();
         return false;
     }
 
     if (!checkCuda(
-            cudaMalloc(&binaryDevice_, pixelCount * sizeof(std::uint8_t)),
+            cudaMalloc(
+                reinterpret_cast<void**>(&binaryDevice_),
+                pixelCount * sizeof(std::uint8_t)
+            ),
             "cudaMalloc binary mask")) {
         release();
         return false;
