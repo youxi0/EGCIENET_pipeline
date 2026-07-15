@@ -96,6 +96,9 @@ bool Int8Calibrator::getBatch(
 
         size_t validImageCount = 0;
         if (!prepareBatch(validImageCount)) {
+            if (processedImageCount_ == 0) {
+                setError("no readable calibration images were provided");
+            }
             return false;
         }
 

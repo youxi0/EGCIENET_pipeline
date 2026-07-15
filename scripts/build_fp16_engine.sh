@@ -1,41 +1,64 @@
 #!/bin/bash
 
-set -e
+set -Eeuo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BUILD_DIR="${PROJECT_ROOT}/build"
-BUILDER="${BUILD_DIR}/bin/egcinet_build_engine"
 
+TENSORRT_ROOT="${TENSORRT_ROOT:-/home/fulin/haiyanghuang/TensorRT-8.6.1.6}"
+TRTEXEC="${TRTEXEC:-${TENSORRT_ROOT}/bin/trtexec}"
 ONNX="${ONNX:-${PROJECT_ROOT}/models/egcinet_352.onnx}"
 ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcinet_352_fp16.engine}"
-INPUT_NAME="${INPUT_NAME:-image}"
-INPUT_W="${INPUT_W:-352}"
-INPUT_H="${INPUT_H:-352}"
-MEAN="${MEAN:-140.505,157.845,135.66}"
-STD="${STD:-61.455,60.18,62.22}"
 WORKSPACE_MIB="${WORKSPACE_MIB:-2048}"
-FORCE_LAYERNORM_FP32="${FORCE_LAYERNORM_FP32:-1}"
+LAYER_PRECISIONS="${LAYER_PRECISIONS:-}"
+LAYER_OUTPUT_TYPES="${LAYER_OUTPUT_TYPES:-}"
 
-if [ ! -x "${BUILDER}" ]; then
-    echo "[ERROR] builder not found: ${BUILDER}"
-    echo "[INFO] run scripts/build.sh first"
+# 优先使用指定 TensorRT 目录中的 trtexec，找不到时再查询 PATH。
+if [ ! -x "${TRTEXEC}" ]; then
+    if command -v trtexec >/dev/null 2>&1; then
+        TRTEXEC=$(command -v trtexec)
+    else
+        echo "[ERROR] trtexec not found: ${TRTEXEC}" >&2
+        exit 1
+    fi
+fi
+
+if [ ! -s "${ONNX}" ]; then
+    echo "[ERROR] ONNX model not found: ${ONNX}" >&2
     exit 1
 fi
 
-echo "[INFO] build FP16 engine"
+mkdir -p "$(dirname "${ENGINE}")"
+export LD_LIBRARY_PATH="${TENSORRT_ROOT}/lib:${TENSORRT_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+
+TRTEXEC_ARGS=(
+    "--onnx=${ONNX}"
+    "--saveEngine=${ENGINE}"
+    --fp16
+    "--memPoolSize=workspace:${WORKSPACE_MIB}"
+    --profilingVerbosity=detailed
+    --skipInference
+)
+
+# 使用 ONNX opset 17 的标准 LayerNormalization 时无需手动指定；旧图可通过环境变量传入精度约束。
+if [ -n "${LAYER_PRECISIONS}" ] || [ -n "${LAYER_OUTPUT_TYPES}" ]; then
+    TRTEXEC_ARGS+=(--precisionConstraints=obey)
+fi
+if [ -n "${LAYER_PRECISIONS}" ]; then
+    TRTEXEC_ARGS+=("--layerPrecisions=${LAYER_PRECISIONS}")
+fi
+if [ -n "${LAYER_OUTPUT_TYPES}" ]; then
+    TRTEXEC_ARGS+=("--layerOutputTypes=${LAYER_OUTPUT_TYPES}")
+fi
+
+echo "[INFO] build FP16 engine with trtexec"
+echo "[INFO] trtexec: ${TRTEXEC}"
 echo "[INFO] onnx: ${ONNX}"
 echo "[INFO] engine: ${ENGINE}"
+"${TRTEXEC}" "${TRTEXEC_ARGS[@]}"
 
-"${BUILDER}" \
-    --onnx "${ONNX}" \
-    --engine "${ENGINE}" \
-    --precision fp16 \
-    --input_name "${INPUT_NAME}" \
-    --input_w "${INPUT_W}" \
-    --input_h "${INPUT_H}" \
-    --mean "${MEAN}" \
-    --std "${STD}" \
-    --workspace_mib "${WORKSPACE_MIB}" \
-    --force_layernorm_fp32 "${FORCE_LAYERNORM_FP32}"
+if [ ! -s "${ENGINE}" ]; then
+    echo "[ERROR] trtexec did not write engine: ${ENGINE}" >&2
+    exit 1
+fi
 
-echo "[INFO] FP16 engine finished: ${ENGINE}"
+echo "[PASS] FP16 engine: ${ENGINE}"
