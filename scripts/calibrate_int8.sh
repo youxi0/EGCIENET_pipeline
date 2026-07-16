@@ -9,7 +9,7 @@ BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
 CALIBRATOR="${CALIBRATOR:-${BUILD_DIR}/bin/egcinet_calibrate_int8}"
 
 ONNX="${ONNX:-${PROJECT_ROOT}/models/egcinet_352.onnx}"
-CALIB_DIR="${CALIB_DIR:-${PROJECT_ROOT}/datasets/images/calibration}"
+CALIB_DIR="${CALIB_DIR:-${PROJECT_ROOT}/Dataset/AEBIS/cal}"
 CALIB_CACHE="${CALIB_CACHE:-${PROJECT_ROOT}/models/egcinet_352_int8.cache}"
 INPUT_NAME="${INPUT_NAME:-image}"
 INPUT_W="${INPUT_W:-352}"

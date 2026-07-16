@@ -58,7 +58,7 @@ if(EGCINET_BUILD_INT8_CALIBRATOR)
     add_executable(egcinet_calibrate_int8
         src/infer/Int8Calibrator.cpp
         src/infer/TensorRTCommon.cpp
-        src/tools/calibrate_int8.cpp
+        src/tools/calibrate_main.cpp
         src/utils/FileLogger.cpp
     )
 
