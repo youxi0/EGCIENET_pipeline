@@ -119,6 +119,22 @@ if(EGCINET_BUILD_PIPELINE)
         ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
     )
 
+    add_library(egcinet_validation STATIC
+        src/evaluation/EngineValidator.cpp
+    )
+
+    target_include_directories(egcinet_validation PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    target_link_libraries(egcinet_validation PUBLIC
+        egcinet_runtime
+    )
+
+    set_target_properties(egcinet_validation PROPERTIES
+        ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+    )
+
     add_executable(egcinet_infer_image
         src/tools/infer_image.cpp
     )
@@ -128,6 +144,18 @@ if(EGCINET_BUILD_PIPELINE)
     )
 
     set_target_properties(egcinet_infer_image PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+
+    add_executable(egcinet_validate
+        src/tools/validate_engines.cpp
+    )
+
+    target_link_libraries(egcinet_validate PRIVATE
+        egcinet_validation
+    )
+
+    set_target_properties(egcinet_validate PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 endif()

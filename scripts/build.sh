@@ -20,4 +20,5 @@ cmake --build "${BUILD_DIR}" --parallel "${JOBS}"
 
 echo "[PASS] build finished"
 echo "[INFO] inference: ${BUILD_DIR}/bin/egcinet_infer_image"
+echo "[INFO] validation: ${BUILD_DIR}/bin/egcinet_validate"
 echo "[INFO] INT8 calibration: ${BUILD_DIR}/bin/egcinet_calibrate_int8"
