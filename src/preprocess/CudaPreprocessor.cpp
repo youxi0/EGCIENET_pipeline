@@ -51,7 +51,7 @@ bool CudaPreprocessor::process(
         return false;
     }
 
-    // 当前 CUDA 预处理只支持写 FP32 或 FP16 输入，防止误写 INT8 binding。
+    // 当前 CUDA 预处理只支持写 FP32 或 FP16 输入，防止误写 INT8 tensor。
     if (inputElementSize != sizeof(float) && inputElementSize != sizeof(__half)) {
         std::cerr << "[CUDA Preprocess] unsupported TensorRT input element size: "
                   << inputElementSize << std::endl;

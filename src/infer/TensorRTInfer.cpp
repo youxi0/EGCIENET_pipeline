@@ -2,7 +2,6 @@
 
 #include <cuda_fp16.h>
 
-#include <array>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -60,7 +59,7 @@ bool TensorRTInfer::load() {
     std::vector<char> engineData;
     if (!readEngineFile(engineData) ||
         !createRuntimeObjects(engineData) ||
-        !inspectBindings()) {
+        !inspectIOTensors()) {
         release();
         return false;
     }
@@ -76,7 +75,7 @@ bool TensorRTInfer::load() {
 }
 
 bool TensorRTInfer::isLoaded() const noexcept {
-    return context_ != nullptr && input_.index >= 0 && output_.index >= 0;
+    return context_ != nullptr && !input_.name.empty() && !output_.name.empty();
 }
 
 bool TensorRTInfer::readEngineFile(std::vector<char>& engineData) const {
@@ -121,11 +120,6 @@ bool TensorRTInfer::createRuntimeObjects(const std::vector<char>& engineData) {
         return false;
     }
 
-    if (engine_->hasImplicitBatchDimension()) {
-        std::cerr << "[TensorRT Infer] implicit-batch engine is not supported" << std::endl;
-        return false;
-    }
-
     context_.reset(engine_->createExecutionContext());
     if (!context_) {
         std::cerr << "[TensorRT Infer] failed to create execution context" << std::endl;
@@ -134,32 +128,45 @@ bool TensorRTInfer::createRuntimeObjects(const std::vector<char>& engineData) {
     return true;
 }
 
-bool TensorRTInfer::inspectBindings() {
-    if (engine_->getNbBindings() != 2) {
+bool TensorRTInfer::inspectIOTensors() {
+    const int32_t ioTensorCount = engine_->getNbIOTensors();
+    if (ioTensorCount != 2) {
         std::cerr << "[TensorRT Infer] expected one input and one output, got "
-                  << engine_->getNbBindings() << " bindings" << std::endl;
+                  << ioTensorCount << " I/O tensors" << std::endl;
         return false;
     }
 
-    input_.index = engine_->getBindingIndex(config_.inputTensorName.c_str());
-    output_.index = engine_->getBindingIndex(config_.outputTensorName.c_str());
-
-    if (input_.index < 0 || output_.index < 0) {
-        std::cerr << "[TensorRT Infer] binding name mismatch, expected input='"
+    if (engine_->getTensorIOMode(config_.inputTensorName.c_str()) !=
+            nvinfer1::TensorIOMode::kINPUT ||
+        engine_->getTensorIOMode(config_.outputTensorName.c_str()) !=
+            nvinfer1::TensorIOMode::kOUTPUT) {
+        std::cerr << "[TensorRT Infer] tensor name or role mismatch, expected input='"
                   << config_.inputTensorName << "', output='"
                   << config_.outputTensorName << "'" << std::endl;
         return false;
     }
 
-    if (!engine_->bindingIsInput(input_.index) ||
-        engine_->bindingIsInput(output_.index)) {
-        std::cerr << "[TensorRT Infer] input/output binding role mismatch" << std::endl;
+    input_.name = config_.inputTensorName;
+    output_.name = config_.outputTensorName;
+
+    if (engine_->getTensorLocation(input_.name.c_str()) !=
+            nvinfer1::TensorLocation::kDEVICE ||
+        engine_->getTensorLocation(output_.name.c_str()) !=
+            nvinfer1::TensorLocation::kDEVICE) {
+        std::cerr << "[TensorRT Infer] input and output tensors must use device memory"
+                  << std::endl;
         return false;
     }
 
-    nvinfer1::Dims engineInputDims = engine_->getBindingDimensions(input_.index);
+    const nvinfer1::Dims engineInputDims =
+        engine_->getTensorShape(input_.name.c_str());
+    if (engineInputDims.nbDims <= 0) {
+        std::cerr << "[TensorRT Infer] failed to query engine input shape" << std::endl;
+        return false;
+    }
+
     if (hasDynamicDimension(engineInputDims)) {
-        if (!context_->setBindingDimensions(input_.index, config_.inputShape)) {
+        if (!context_->setInputShape(input_.name.c_str(), config_.inputShape)) {
             std::cerr << "[TensorRT Infer] failed to set dynamic input shape" << std::endl;
             return false;
         }
@@ -168,18 +175,22 @@ bool TensorRTInfer::inspectBindings() {
         return false;
     }
 
-    if (!context_->allInputDimensionsSpecified()) {
-        std::cerr << "[TensorRT Infer] input dimensions are not fully specified" << std::endl;
+    // TensorRT 10 的名称接口通过 inferShapes 检查动态尺寸是否已完整指定。
+    const int32_t shapeStatus = context_->inferShapes(0, nullptr);
+    if (shapeStatus < 0) {
+        std::cerr << "[TensorRT Infer] shape inference failed" << std::endl;
+        return false;
+    }
+    if (shapeStatus > 0) {
+        std::cerr << "[TensorRT Infer] shape inference has "
+                  << shapeStatus << " insufficient input tensors" << std::endl;
         return false;
     }
 
-    input_.name = engine_->getBindingName(input_.index);
-    input_.dims = context_->getBindingDimensions(input_.index);
-    input_.dataType = engine_->getBindingDataType(input_.index);
-
-    output_.name = engine_->getBindingName(output_.index);
-    output_.dims = context_->getBindingDimensions(output_.index);
-    output_.dataType = engine_->getBindingDataType(output_.index);
+    input_.dims = context_->getTensorShape(input_.name.c_str());
+    input_.dataType = engine_->getTensorDataType(input_.name.c_str());
+    output_.dims = context_->getTensorShape(output_.name.c_str());
+    output_.dataType = engine_->getTensorDataType(output_.name.c_str());
 
     // 当前预处理和后处理都按固定的 NCHW 单批次分割模型设计。
     if (input_.dims.nbDims != 4 || input_.dims.d[0] != 1 || input_.dims.d[1] != 3) {
@@ -189,6 +200,29 @@ bool TensorRTInfer::inspectBindings() {
 
     if (output_.dims.nbDims != 4 || output_.dims.d[0] != 1 || output_.dims.d[1] != 1) {
         std::cerr << "[TensorRT Infer] output must be [1,1,H,W]" << std::endl;
+        return false;
+    }
+
+    if (hasDynamicDimension(input_.dims) || hasDynamicDimension(output_.dims)) {
+        std::cerr << "[TensorRT Infer] unresolved runtime tensor dimensions" << std::endl;
+        return false;
+    }
+
+    if (input_.dims.d[2] > std::numeric_limits<int>::max() ||
+        input_.dims.d[3] > std::numeric_limits<int>::max() ||
+        output_.dims.d[2] > std::numeric_limits<int>::max() ||
+        output_.dims.d[3] > std::numeric_limits<int>::max()) {
+        std::cerr << "[TensorRT Infer] tensor height or width exceeds int range"
+                  << std::endl;
+        return false;
+    }
+
+    if (engine_->getTensorFormat(input_.name.c_str()) !=
+            nvinfer1::TensorFormat::kLINEAR ||
+        engine_->getTensorFormat(output_.name.c_str()) !=
+            nvinfer1::TensorFormat::kLINEAR) {
+        std::cerr << "[TensorRT Infer] only linear input/output tensor format is supported"
+                  << std::endl;
         return false;
     }
 
@@ -208,14 +242,19 @@ bool TensorRTInfer::inspectBindings() {
 
     input_.elementCount = elementCount(input_.dims);
     output_.elementCount = elementCount(output_.dims);
-    input_.bytes = input_.elementCount * elementSize(input_.dataType);
-    output_.bytes = output_.elementCount * elementSize(output_.dataType);
+    const size_t inputElementBytes = elementSize(input_.dataType);
+    const size_t outputElementBytes = elementSize(output_.dataType);
 
-    if (input_.bytes == 0 || output_.bytes == 0) {
+    if (input_.elementCount == 0 || output_.elementCount == 0 ||
+        inputElementBytes == 0 || outputElementBytes == 0 ||
+        input_.elementCount > std::numeric_limits<size_t>::max() / inputElementBytes ||
+        output_.elementCount > std::numeric_limits<size_t>::max() / outputElementBytes) {
         std::cerr << "[TensorRT Infer] invalid input or output buffer size" << std::endl;
         return false;
     }
 
+    input_.bytes = input_.elementCount * inputElementBytes;
+    output_.bytes = output_.elementCount * outputElementBytes;
     return true;
 }
 
@@ -279,11 +318,14 @@ bool TensorRTInfer::enqueue(
     void* outputDevice,
     cudaStream_t stream
 ) {
-    std::array<void*, 2> bindings{};
-    bindings[static_cast<size_t>(input_.index)] = inputDevice;
-    bindings[static_cast<size_t>(output_.index)] = outputDevice;
-    if (!context_->enqueueV2(bindings.data(), stream, nullptr)) {
-        std::cerr << "[TensorRT Infer] enqueueV2 failed" << std::endl;
+    if (!context_->setTensorAddress(input_.name.c_str(), inputDevice) ||
+        !context_->setTensorAddress(output_.name.c_str(), outputDevice)) {
+        std::cerr << "[TensorRT Infer] failed to set I/O tensor addresses" << std::endl;
+        return false;
+    }
+
+    if (!context_->enqueueV3(stream)) {
+        std::cerr << "[TensorRT Infer] enqueueV3 failed" << std::endl;
         return false;
     }
 
@@ -307,11 +349,11 @@ size_t TensorRTInfer::inputElementSize() const noexcept {
 }
 
 int TensorRTInfer::inputWidth() const noexcept {
-    return isLoaded() ? input_.dims.d[3] : 0;
+    return isLoaded() ? static_cast<int>(input_.dims.d[3]) : 0;
 }
 
 int TensorRTInfer::inputHeight() const noexcept {
-    return isLoaded() ? input_.dims.d[2] : 0;
+    return isLoaded() ? static_cast<int>(input_.dims.d[2]) : 0;
 }
 
 void* TensorRTInfer::outputDeviceBuffer() noexcept {
@@ -335,11 +377,11 @@ size_t TensorRTInfer::outputElementSize() const noexcept {
 }
 
 int TensorRTInfer::outputWidth() const noexcept {
-    return isLoaded() ? output_.dims.d[3] : 0;
+    return isLoaded() ? static_cast<int>(output_.dims.d[3]) : 0;
 }
 
 int TensorRTInfer::outputHeight() const noexcept {
-    return isLoaded() ? output_.dims.d[2] : 0;
+    return isLoaded() ? static_cast<int>(output_.dims.d[2]) : 0;
 }
 
 cudaStream_t TensorRTInfer::stream() const noexcept {
@@ -352,8 +394,8 @@ void TensorRTInfer::release() noexcept {
     engine_.reset();
     runtime_.reset();
 
-    input_ = BindingInfo{};
-    output_ = BindingInfo{};
+    input_ = TensorInfo{};
+    output_ = TensorInfo{};
 }
 
 bool TensorRTInfer::hasDynamicDimension(const nvinfer1::Dims& dims) noexcept {

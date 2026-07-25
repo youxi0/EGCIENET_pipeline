@@ -14,7 +14,7 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
 set(TENSORRT_ROOT "" CACHE PATH "TensorRT installation root")
-set(_TENSORRT_HINTS
+set(_TENSORRT_ROOT_HINTS
     ${TENSORRT_ROOT}
     $ENV{TENSORRT_ROOT}
     $ENV{TENSORRT_DIR}
@@ -22,29 +22,119 @@ set(_TENSORRT_HINTS
     /usr/local
 )
 
+set(_TENSORRT_INCLUDE_SUFFIXES
+    include
+    include/x86_64-linux-gnu
+    include/aarch64-linux-gnu
+)
+set(_TENSORRT_LIBRARY_SUFFIXES
+    lib
+    lib64
+    lib/x86_64-linux-gnu
+    lib/aarch64-linux-gnu
+)
+if(CMAKE_LIBRARY_ARCHITECTURE)
+    list(APPEND _TENSORRT_INCLUDE_SUFFIXES
+        include/${CMAKE_LIBRARY_ARCHITECTURE}
+    )
+    list(APPEND _TENSORRT_LIBRARY_SUFFIXES
+        lib/${CMAKE_LIBRARY_ARCHITECTURE}
+    )
+endif()
+list(REMOVE_DUPLICATES _TENSORRT_INCLUDE_SUFFIXES)
+list(REMOVE_DUPLICATES _TENSORRT_LIBRARY_SUFFIXES)
+
+# Jetson 的 Debian 包把头文件和动态库安装在 multiarch 系统目录中。
+set(_TENSORRT_SYSTEM_INCLUDE_PATHS
+    /usr/include
+    /usr/include/aarch64-linux-gnu
+    /usr/include/x86_64-linux-gnu
+)
+set(_TENSORRT_SYSTEM_LIBRARY_PATHS
+    /usr/lib
+    /usr/lib/aarch64-linux-gnu
+    /usr/lib/x86_64-linux-gnu
+)
+
 find_path(TENSORRT_INCLUDE_DIR
     NAMES NvInfer.h
-    HINTS ${_TENSORRT_HINTS}
-    PATH_SUFFIXES include include/x86_64-linux-gnu include/aarch64-linux-gnu
+    HINTS ${_TENSORRT_ROOT_HINTS}
+    PATHS ${_TENSORRT_SYSTEM_INCLUDE_PATHS}
+    PATH_SUFFIXES ${_TENSORRT_INCLUDE_SUFFIXES}
 )
 
 find_library(TENSORRT_NVINFER_LIB
     NAMES nvinfer
-    HINTS ${_TENSORRT_HINTS}
-    PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu lib/aarch64-linux-gnu
+    HINTS ${_TENSORRT_ROOT_HINTS}
+    PATHS ${_TENSORRT_SYSTEM_LIBRARY_PATHS}
+    PATH_SUFFIXES ${_TENSORRT_LIBRARY_SUFFIXES}
 )
 
 find_library(TENSORRT_NVONNXPARSER_LIB
     NAMES nvonnxparser
-    HINTS ${_TENSORRT_HINTS}
-    PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu lib/aarch64-linux-gnu
+    HINTS ${_TENSORRT_ROOT_HINTS}
+    PATHS ${_TENSORRT_SYSTEM_LIBRARY_PATHS}
+    PATH_SUFFIXES ${_TENSORRT_LIBRARY_SUFFIXES}
 )
 
 if(NOT TENSORRT_INCLUDE_DIR OR NOT TENSORRT_NVINFER_LIB)
     message(FATAL_ERROR
         "TensorRT was not found. Set -DTENSORRT_ROOT=/path/to/TensorRT "
-        "or export TENSORRT_ROOT/TENSORRT_DIR."
+        "or install the Jetson libnvinfer-dev package."
     )
+endif()
+
+set(_TENSORRT_VERSION_HEADER "${TENSORRT_INCLUDE_DIR}/NvInferVersion.h")
+if(NOT EXISTS "${_TENSORRT_VERSION_HEADER}")
+    message(FATAL_ERROR
+        "NvInferVersion.h was not found under ${TENSORRT_INCLUDE_DIR}."
+    )
+endif()
+
+file(READ "${_TENSORRT_VERSION_HEADER}" _TENSORRT_VERSION_CONTENT)
+foreach(_TENSORRT_VERSION_PART MAJOR MINOR PATCH BUILD)
+    string(
+        REGEX MATCH
+        "#define[ \t]+NV_TENSORRT_${_TENSORRT_VERSION_PART}[ \t]+([0-9]+)"
+        _TENSORRT_VERSION_MATCH
+        "${_TENSORRT_VERSION_CONTENT}"
+    )
+    if(NOT _TENSORRT_VERSION_MATCH)
+        string(
+            REGEX MATCH
+            "#define[ \t]+TRT_${_TENSORRT_VERSION_PART}_ENTERPRISE[ \t]+([0-9]+)"
+            _TENSORRT_VERSION_MATCH
+            "${_TENSORRT_VERSION_CONTENT}"
+        )
+    endif()
+    if(NOT _TENSORRT_VERSION_MATCH)
+        message(FATAL_ERROR
+            "Failed to parse NV_TENSORRT_${_TENSORRT_VERSION_PART} "
+            "from ${_TENSORRT_VERSION_HEADER}."
+        )
+    endif()
+    set(
+        _TENSORRT_VERSION_${_TENSORRT_VERSION_PART}
+        "${CMAKE_MATCH_1}"
+    )
+endforeach()
+
+if(_TENSORRT_VERSION_MAJOR LESS 10)
+    message(FATAL_ERROR
+        "TensorRT 10 or newer is required; found "
+        "${_TENSORRT_VERSION_MAJOR}.${_TENSORRT_VERSION_MINOR}."
+    )
+endif()
+
+set(TENSORRT_VERSION
+    "${_TENSORRT_VERSION_MAJOR}.${_TENSORRT_VERSION_MINOR}.${_TENSORRT_VERSION_PATCH}.${_TENSORRT_VERSION_BUILD}"
+)
+
+message(STATUS "TensorRT version: ${TENSORRT_VERSION}")
+message(STATUS "TensorRT include directory: ${TENSORRT_INCLUDE_DIR}")
+message(STATUS "TensorRT nvinfer library: ${TENSORRT_NVINFER_LIB}")
+if(TENSORRT_NVONNXPARSER_LIB)
+    message(STATUS "TensorRT ONNX parser library: ${TENSORRT_NVONNXPARSER_LIB}")
 endif()
 
 if(EGCINET_BUILD_INT8_CALIBRATOR)

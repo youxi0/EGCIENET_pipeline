@@ -949,7 +949,7 @@ private:
     std::unique_ptr<SegPostprocessor> postprocessor_;
     std::vector<std::unique_ptr<FrameSlot>> slots_;
 
-    // GPU Scheduler 串行提交任务，因此所有帧安全复用同一组 TensorRT binding 显存。
+    // GPU Scheduler 串行提交任务，因此所有帧安全复用同一组 TensorRT 输入输出显存。
     void* inputDevice_ = nullptr;
     void* outputDevice_ = nullptr;
     size_t inputBytes_ = 0;

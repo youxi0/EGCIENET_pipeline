@@ -3,6 +3,8 @@
 set -Eeuo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
+
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
 EXECUTABLE="${BUILD_DIR}/bin/egcinet_pipeline"
 
@@ -31,6 +33,8 @@ if [ "${TYPE}" != "camera" ] && [ ! -e "${SOURCE}" ]; then
     echo "[ERROR] source not found: ${SOURCE}"
     exit 1
 fi
+
+configure_tensorrt_library_path
 
 echo "[INFO] start EGCINET pipeline"
 echo "[INFO] engine    : ${ENGINE}"

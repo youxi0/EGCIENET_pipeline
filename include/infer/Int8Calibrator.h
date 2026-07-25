@@ -27,6 +27,7 @@ struct Int8CalibratorConfig {
     bool readCache = true;
 };
 
+// TensorRT 10.16 仍支持该 legacy 校准接口，但 NVIDIA 已建议新模型改用显式 Q/DQ。
 class Int8Calibrator final : public nvinfer1::IInt8EntropyCalibrator2 {
 public:
     explicit Int8Calibrator(Int8CalibratorConfig config);
@@ -76,7 +77,7 @@ private:
     // 检查图片扩展名是否属于 jpg/jpeg/png/bmp/tif/tiff 白名单。
     bool isSupportedImage(const std::string& path) const;
 
-    // 查找 inputTensorName 对应的 TensorRT binding。
+    // legacy getBatch 回调仍以 binding 数组传递校准输入，这里查找对应槽位。
     int findInputBinding(const char* names[], int nbBindings) const;
 
     // 检查磁盘上是否存在非空的普通文件；实际读取由 readCalibrationCache 完成。

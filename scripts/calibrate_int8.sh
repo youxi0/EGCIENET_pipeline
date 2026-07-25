@@ -3,8 +3,8 @@
 set -Eeuo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
 
-TENSORRT_ROOT="${TENSORRT_ROOT:-/home/fulin/haiyanghuang/TensorRT-8.6.1.6}"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
 CALIBRATOR="${CALIBRATOR:-${BUILD_DIR}/bin/egcinet_calibrate_int8}"
 
@@ -34,7 +34,7 @@ if [ ! -d "${CALIB_DIR}" ]; then
     exit 1
 fi
 
-export LD_LIBRARY_PATH="${TENSORRT_ROOT}/lib:${TENSORRT_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+configure_tensorrt_library_path
 mkdir -p "$(dirname "${CALIB_CACHE}")"
 
 echo "[INFO] generate INT8 calibration cache"

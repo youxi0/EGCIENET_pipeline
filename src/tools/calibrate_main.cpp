@@ -179,23 +179,22 @@ int main(int argc, char** argv) {
         }
 
         TrtLogger logger;
-        std::unique_ptr<nvinfer1::IBuilder, TrtDestroy<nvinfer1::IBuilder>> builder(
+        std::unique_ptr<nvinfer1::IBuilder> builder(
             nvinfer1::createInferBuilder(logger)
         );
         if (!builder) {
             throw std::runtime_error("failed to create TensorRT builder");
         }
 
-        const uint32_t explicitBatchFlag =
-            1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
-        std::unique_ptr<nvinfer1::INetworkDefinition, TrtDestroy<nvinfer1::INetworkDefinition>> network(
-            builder->createNetworkV2(explicitBatchFlag)
+        // TensorRT 10 的 createNetworkV2 默认使用 explicit batch 和动态形状。
+        std::unique_ptr<nvinfer1::INetworkDefinition> network(
+            builder->createNetworkV2(0U)
         );
         if (!network) {
             throw std::runtime_error("failed to create TensorRT network");
         }
 
-        std::unique_ptr<nvonnxparser::IParser, TrtDestroy<nvonnxparser::IParser>> parser(
+        std::unique_ptr<nvonnxparser::IParser> parser(
             nvonnxparser::createParser(*network, logger)
         );
         if (!parser) {
@@ -219,7 +218,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("invalid calibrator: " + calibrator.lastError());
         }
 
-        std::unique_ptr<nvinfer1::IBuilderConfig, TrtDestroy<nvinfer1::IBuilderConfig>> buildConfig(
+        std::unique_ptr<nvinfer1::IBuilderConfig> buildConfig(
             builder->createBuilderConfig()
         );
         if (!buildConfig) {
@@ -237,7 +236,7 @@ int main(int argc, char** argv) {
         utils::FileLogger::instance().info(
             "[INT8 Calibration] start calibration; temporary engine plan will be discarded"
         );
-        std::unique_ptr<nvinfer1::IHostMemory, TrtDestroy<nvinfer1::IHostMemory>> temporaryPlan(
+        std::unique_ptr<nvinfer1::IHostMemory> temporaryPlan(
             builder->buildSerializedNetwork(*network, *buildConfig)
         );
         if (!temporaryPlan) {

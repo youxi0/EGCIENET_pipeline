@@ -30,7 +30,7 @@ public:
     ) noexcept;
     void detachOutputBuffers() noexcept;
 
-    // 输入为 TensorRT output binding；输出仍保留在 GPU，不执行 D2H。
+    // 输入为 TensorRT output tensor；输出仍保留在 GPU，不执行 D2H。
     bool process(
         const void* modelMaskDevice,
         size_t modelBufferBytes,

@@ -240,7 +240,7 @@ int main(int argc, char** argv) {
         return 3;
     }
 
-    // 预处理尺寸直接取自 engine，避免配置值与 binding 尺寸不一致。
+    // 预处理尺寸直接取自 engine，避免配置值与输入 tensor 尺寸不一致。
     CudaPreprocessor preprocessor(infer.inputWidth(), infer.inputHeight());
     SegPostprocessor postprocessor;
     Visualizer visualizer;

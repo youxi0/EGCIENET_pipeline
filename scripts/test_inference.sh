@@ -3,8 +3,8 @@
 set -Eeuo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
 
-TENSORRT_ROOT="${TENSORRT_ROOT:-/home/fulin/haiyanghuang/TensorRT-8.6.1.6}"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build-debug}"
 RESULT_DIR="${RESULT_DIR:-${PROJECT_ROOT}/results/debug_inference}"
 ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcinet_352_fp16.engine}"
@@ -75,16 +75,21 @@ require_command tee
 require_file "engine" "${ENGINE}"
 require_file "image" "${IMAGE}"
 
-export LD_LIBRARY_PATH="${TENSORRT_ROOT}/lib:${TENSORRT_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+configure_tensorrt_library_path
 
 if [ "${SKIP_BUILD}" != "1" ]; then
     require_command cmake
-    require_file "TensorRT header" "${TENSORRT_ROOT}/include/NvInfer.h"
+
+    TENSORRT_ARGS=()
+    if [ -n "${TENSORRT_ROOT:-}" ]; then
+        TENSORRT_ARGS+=("-DTENSORRT_ROOT=${TENSORRT_ROOT}")
+    fi
 
     echo "[INFO] configure debug build: ${BUILD_DIR}"
     cmake -S "${PROJECT_ROOT}" -B "${BUILD_DIR}" \
         -DEGCINET_BUILD_PIPELINE=ON \
-        -DTENSORRT_ROOT="${TENSORRT_ROOT}" \
+        -DEGCINET_BUILD_INT8_CALIBRATOR=OFF \
+        "${TENSORRT_ARGS[@]}" \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DCMAKE_CUDA_FLAGS_RELWITHDEBINFO="-O2 -g -lineinfo"
 

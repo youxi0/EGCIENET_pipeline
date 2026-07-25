@@ -3,9 +3,7 @@
 set -Eeuo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-
-TENSORRT_ROOT="${TENSORRT_ROOT:-/home/fulin/haiyanghuang/TensorRT-8.6.1.6}"
-TRTEXEC="${TRTEXEC:-${TENSORRT_ROOT}/bin/trtexec}"
+source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
 
 ONNX="${ONNX:-${PROJECT_ROOT}/models/egcinet_352.onnx}"
 ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcinet_352_int8.engine}"
@@ -14,21 +12,14 @@ WORKSPACE_MIB="${WORKSPACE_MIB:-2048}"
 LAYER_PRECISIONS="${LAYER_PRECISIONS:-}"
 LAYER_OUTPUT_TYPES="${LAYER_OUTPUT_TYPES:-}"
 
-if [ ! -x "${TRTEXEC}" ]; then
-    if command -v trtexec >/dev/null 2>&1; then
-        TRTEXEC=$(command -v trtexec)
-    else
-        echo "[ERROR] trtexec not found: ${TRTEXEC}" >&2
-        exit 1
-    fi
-fi
+TRTEXEC=$(resolve_trtexec)
 
 if [ ! -s "${ONNX}" ]; then
     echo "[ERROR] ONNX model not found: ${ONNX}" >&2
     exit 1
 fi
 
-export LD_LIBRARY_PATH="${TENSORRT_ROOT}/lib:${TENSORRT_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+configure_tensorrt_library_path
 mkdir -p "$(dirname "${ENGINE}")"
 
 if [ ! -s "${CALIB_CACHE}" ]; then
