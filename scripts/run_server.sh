@@ -1,16 +1,20 @@
 #!/bin/bash
 
-set -e
+set -Eeuo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-EXECUTABLE="${PROJECT_ROOT}/build/bin/blade_demo"
+BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
+EXECUTABLE="${BUILD_DIR}/bin/egcinet_pipeline"
 
-# ${变量名:-默认值}
-ENGINE="${ENGINE:-${PROJECT_ROOT}/models/best_fp16.engine}"
-SOURCE="${SOURCE:-${PROJECT_ROOT}/data/blade_images}"
-TYPE="folder"
-PORT=9000
-CLASSES="crack,corrosion,coating_loss,material_loss"
+ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcinet_352_fp16.engine}"
+SOURCE="${SOURCE:-${PROJECT_ROOT}/datasets/images/val}"
+TYPE="${TYPE:-folder}"
+QUEUE_SIZE="${QUEUE_SIZE:-3}"
+MAX_WIDTH="${MAX_WIDTH:-1920}"
+MAX_HEIGHT="${MAX_HEIGHT:-1080}"
+THRESHOLD="${THRESHOLD:-0.5}"
+SAVE_DIR="${SAVE_DIR:-}"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/results/logs}"
 
 if [ ! -f "${EXECUTABLE}" ]; then
     echo "[ERROR] executable not found: ${EXECUTABLE}"
@@ -23,21 +27,33 @@ if [ ! -f "${ENGINE}" ]; then
     exit 1
 fi
 
-if [ ! -e "${SOURCE}" ]; then
+if [ "${TYPE}" != "camera" ] && [ ! -e "${SOURCE}" ]; then
     echo "[ERROR] source not found: ${SOURCE}"
     exit 1
 fi
 
-echo "[INFO] start blade server"
-echo "[INFO] engine : ${ENGINE}"
-echo "[INFO] source : ${SOURCE}"
-echo "[INFO] type   : ${TYPE}"
-echo "[INFO] port   : ${PORT}"
-echo "[INFO] classes: ${CLASSES}"
+echo "[INFO] start EGCINET pipeline"
+echo "[INFO] engine    : ${ENGINE}"
+echo "[INFO] source    : ${SOURCE}"
+echo "[INFO] type      : ${TYPE}"
+echo "[INFO] queue size: ${QUEUE_SIZE}"
+echo "[INFO] max source: ${MAX_WIDTH}x${MAX_HEIGHT}"
+echo "[INFO] threshold : ${THRESHOLD}"
+echo "[INFO] log dir   : ${LOG_DIR}"
 
-"${EXECUTABLE}" \
-    --engine "${ENGINE}" \
-    --source "${SOURCE}" \
-    --type "${TYPE}" \
-    --port "${PORT}" \
-    --classes "${CLASSES}"
+ARGS=(
+    --engine "${ENGINE}"
+    --source "${SOURCE}"
+    --type "${TYPE}"
+    --queue_size "${QUEUE_SIZE}"
+    --max_width "${MAX_WIDTH}"
+    --max_height "${MAX_HEIGHT}"
+    --threshold "${THRESHOLD}"
+    --log_dir "${LOG_DIR}"
+)
+
+if [ -n "${SAVE_DIR}" ]; then
+    ARGS+=(--save_dir "${SAVE_DIR}")
+fi
+
+"${EXECUTABLE}" "${ARGS[@]}"

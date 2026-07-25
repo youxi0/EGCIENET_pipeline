@@ -10,6 +10,7 @@
 
 struct FrameCost {
     double acquire_ms = 0.0;
+    double h2d_ms = 0.0;
     double preprocess_ms = 0.0;
     double infer_ms = 0.0;
     double postprocess_ms = 0.0;
@@ -23,7 +24,7 @@ struct FrameData {
     double timestamp_ms = 0.0;
     std::string source_path;
 
-    // 采集到的 BGR 原图；GPU 链路用其尺寸恢复 mask，并生成可视化结果。
+    // 采集到的 BGR 原图；获取线程用其完成 H2D，后续阶段保留尺寸信息恢复 mask。
     cv::Mat originalImage;
 
     // CPU/CUDA 预处理和后处理共享的 resize/归一化元信息。

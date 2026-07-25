@@ -50,6 +50,7 @@ struct AccuracySummary {
 };
 
 struct PerformanceSummary {
+    TimingDistribution h2d;
     TimingDistribution preprocess;
     TimingDistribution inference;
     TimingDistribution postprocess;

@@ -1,9 +1,12 @@
 #include "acquisition/ImageFolderSource.h"
 
-#include <opencv2/opencv.hpp>
-#include <filesystem>
 #include <algorithm>
+#include <cctype>
+#include <cstddef>
+#include <filesystem>
 #include <iostream>
+#include <opencv2/imgcodecs.hpp>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -13,7 +16,6 @@ ImageFolderSource::ImageFolderSource(const std::string& folder_path)
 bool ImageFolderSource::open() {
     image_paths_.clear();
     current_index_ = 0;
-
 
     if (!fs::exists(folder_path_)) {
         std::cerr << "Folder does not exist: " << folder_path_ << std::endl;
@@ -46,29 +48,22 @@ bool ImageFolderSource::open() {
 }
 
 bool ImageFolderSource::read(FrameData& frame) {
-    if (current_index_ >= image_paths_.size()) {
+    // 跳过损坏图像时使用循环，避免连续坏图导致递归栈增长。
+    while (current_index_ < image_paths_.size()) {
+        const std::size_t frameId = current_index_;
+        const std::string& imagePath = image_paths_[current_index_++];
+        cv::Mat image = cv::imread(imagePath, cv::IMREAD_COLOR);
+        if (image.empty()) {
+            std::cerr << "Failed to read image: " << imagePath << std::endl;
+            continue;
+        }
 
-        return false;
+        frame.frameId = frameId;
+        frame.source_path = imagePath;
+        frame.originalImage = std::move(image);
+        return true;
     }
-    
-
-    std::string image_path = image_paths_[current_index_];
-
-    cv::Mat image = cv::imread(image_path, cv::IMREAD_COLOR);
-
-    if (image.empty()) {
-        std::cerr << "Failed to read image: " << image_path << std::endl;
-        current_index_++;
-        return read(frame);
-    }
-
-    frame.frameId = current_index_++;
-    // frame.timestamp_ms = getCurrentTimestampMs();
-    frame.source_path = image_path;
-    frame.originalImage = image;
-
-
-    return true;
+    return false;
 }
 
 void ImageFolderSource::reset() {
@@ -82,8 +77,9 @@ void ImageFolderSource::release() {
 
 bool ImageFolderSource::isImageFile(const std::string& path) const {
     std::string ext = fs::path(path).extension().string();
-    // 用于统一转换为小写
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
 
     return ext == ".jpg" ||
            ext == ".jpeg" ||

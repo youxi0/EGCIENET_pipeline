@@ -2,6 +2,7 @@
 
 #include <cuda_fp16.h>
 
+#include <array>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -36,17 +37,7 @@ void printDimensions(const nvinfer1::Dims& dims) {
     }
 }
 
-bool checkCuda(cudaError_t status, const char* operation) {
-    if (status == cudaSuccess) {
-        return true;
-    }
-
-    std::cerr << "[TensorRT Infer] " << operation << " failed: "
-              << cudaGetErrorString(status) << std::endl;
-    return false;
-}
-
-} // namespace
+} // 匿名命名空间
 
 TensorRTInfer::TensorRTInfer(std::string enginePath)
     : TensorRTInfer(TensorRTInferConfig{std::move(enginePath)}) {}
@@ -69,8 +60,7 @@ bool TensorRTInfer::load() {
     std::vector<char> engineData;
     if (!readEngineFile(engineData) ||
         !createRuntimeObjects(engineData) ||
-        !inspectBindings() ||
-        !allocateDeviceBuffers()) {
+        !inspectBindings()) {
         release();
         return false;
     }
@@ -86,8 +76,7 @@ bool TensorRTInfer::load() {
 }
 
 bool TensorRTInfer::isLoaded() const noexcept {
-    return context_ != nullptr && stream_ != nullptr &&
-           input_.index >= 0 && output_.index >= 0;
+    return context_ != nullptr && input_.index >= 0 && output_.index >= 0;
 }
 
 bool TensorRTInfer::readEngineFile(std::vector<char>& engineData) const {
@@ -142,11 +131,7 @@ bool TensorRTInfer::createRuntimeObjects(const std::vector<char>& engineData) {
         std::cerr << "[TensorRT Infer] failed to create execution context" << std::endl;
         return false;
     }
-
-    return checkCuda(
-        cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
-        "cudaStreamCreateWithFlags"
-    );
+    return true;
 }
 
 bool TensorRTInfer::inspectBindings() {
@@ -234,90 +219,70 @@ bool TensorRTInfer::inspectBindings() {
     return true;
 }
 
-bool TensorRTInfer::allocateDeviceBuffers() {
-    deviceBuffers_.assign(static_cast<size_t>(engine_->getNbBindings()), nullptr);
-
-    if (!checkCuda(
-            cudaMalloc(&deviceBuffers_[input_.index], input_.bytes),
-            "cudaMalloc input")) {
+bool TensorRTInfer::attachExecutionResources(
+    void* inputDevice,
+    size_t inputBufferBytes,
+    void* outputDevice,
+    size_t outputBufferBytes,
+    cudaStream_t stream
+) noexcept {
+    if (!isLoaded() || inputDevice == nullptr || outputDevice == nullptr ||
+        stream == nullptr || inputBufferBytes < input_.bytes ||
+        outputBufferBytes < output_.bytes) {
         return false;
     }
 
-    if (!checkCuda(
-            cudaMalloc(&deviceBuffers_[output_.index], output_.bytes),
-            "cudaMalloc output")) {
-        return false;
-    }
-
+    attachedInputDevice_ = inputDevice;
+    attachedOutputDevice_ = outputDevice;
+    attachedStream_ = stream;
     return true;
 }
 
-bool TensorRTInfer::infer(const cv::Mat& inputBlob) {
-    if (!validateInputBlob(inputBlob)) {
-        return false;
-    }
-
-    const void* hostInput = inputBlob.ptr<float>();
-    if (input_.dataType == nvinfer1::DataType::kHALF) {
-        hostInputScratch_.resize(input_.elementCount);
-        __half* halfInput = hostInputScratch_.data();
-        const float* floatInput = inputBlob.ptr<float>();
-
-        for (size_t index = 0; index < input_.elementCount; ++index) {
-            halfInput[index] = __float2half_rn(floatInput[index]);
-        }
-        hostInput = halfInput;
-    }
-
-    if (!checkCuda(
-            cudaMemcpyAsync(
-                deviceBuffers_[input_.index],
-                hostInput,
-                input_.bytes,
-                cudaMemcpyHostToDevice,
-                stream_
-            ),
-            "cudaMemcpyAsync input H2D")) {
-        return false;
-    }
-
-    return enqueue();
+void TensorRTInfer::detachExecutionResources() noexcept {
+    attachedInputDevice_ = nullptr;
+    attachedOutputDevice_ = nullptr;
+    attachedStream_ = nullptr;
 }
 
 bool TensorRTInfer::inferFromDevice() {
-    if (!isLoaded() || deviceBuffers_[input_.index] == nullptr) {
-        std::cerr << "[TensorRT Infer] engine is not loaded" << std::endl;
+    if (!isLoaded() || attachedInputDevice_ == nullptr ||
+        attachedOutputDevice_ == nullptr || attachedStream_ == nullptr) {
+        std::cerr << "[TensorRT Infer] execution resources are not attached" << std::endl;
         return false;
     }
-
-    // 预处理与推理共用同一个 CUDA 流，enqueue 会自然等待前面的预处理完成。
-    return enqueue();
+    return enqueue(attachedInputDevice_, attachedOutputDevice_, attachedStream_);
 }
 
-bool TensorRTInfer::validateInputBlob(const cv::Mat& inputBlob) const {
-    if (!isLoaded()) {
-        std::cerr << "[TensorRT Infer] engine is not loaded" << std::endl;
+bool TensorRTInfer::inferFromDeviceBuffers(
+    void* inputDevice,
+    size_t inputBufferBytes,
+    void* outputDevice,
+    size_t outputBufferBytes,
+    cudaStream_t stream
+) {
+    if (!isLoaded() || inputDevice == nullptr || outputDevice == nullptr ||
+        stream == nullptr) {
+        std::cerr << "[TensorRT Infer] invalid external device buffers or stream"
+                  << std::endl;
+        return false;
+    }
+    if (inputBufferBytes < input_.bytes || outputBufferBytes < output_.bytes) {
+        std::cerr << "[TensorRT Infer] external device buffer is too small" << std::endl;
         return false;
     }
 
-    if (inputBlob.empty() || inputBlob.type() != CV_32F ||
-        inputBlob.dims != input_.dims.nbDims || !inputBlob.isContinuous()) {
-        std::cerr << "[TensorRT Infer] input must be a continuous FP32 NCHW blob" << std::endl;
-        return false;
-    }
-
-    for (int index = 0; index < input_.dims.nbDims; ++index) {
-        if (inputBlob.size[index] != input_.dims.d[index]) {
-            std::cerr << "[TensorRT Infer] input blob shape mismatch" << std::endl;
-            return false;
-        }
-    }
-
-    return true;
+    return enqueue(inputDevice, outputDevice, stream);
 }
 
-bool TensorRTInfer::enqueue() {
-    if (!context_->enqueueV2(deviceBuffers_.data(), stream_, nullptr)) {
+bool TensorRTInfer::enqueue(
+    void* inputDevice,
+    void* outputDevice,
+    cudaStream_t stream
+) {
+    std::array<void*, 2> bindings{};
+    bindings[static_cast<size_t>(input_.index)] = inputDevice;
+    bindings[static_cast<size_t>(output_.index)] = outputDevice;
+    if (!context_->enqueueV2(bindings.data(), stream, nullptr)) {
         std::cerr << "[TensorRT Infer] enqueueV2 failed" << std::endl;
         return false;
     }
@@ -326,10 +291,7 @@ bool TensorRTInfer::enqueue() {
 }
 
 void* TensorRTInfer::inputDeviceBuffer() noexcept {
-    if (!isLoaded() || input_.index >= static_cast<int>(deviceBuffers_.size())) {
-        return nullptr;
-    }
-    return deviceBuffers_[input_.index];
+    return attachedInputDevice_;
 }
 
 size_t TensorRTInfer::inputBufferBytes() const noexcept {
@@ -352,11 +314,12 @@ int TensorRTInfer::inputHeight() const noexcept {
     return isLoaded() ? input_.dims.d[2] : 0;
 }
 
+void* TensorRTInfer::outputDeviceBuffer() noexcept {
+    return attachedOutputDevice_;
+}
+
 const void* TensorRTInfer::outputDeviceBuffer() const noexcept {
-    if (!isLoaded() || output_.index >= static_cast<int>(deviceBuffers_.size())) {
-        return nullptr;
-    }
-    return deviceBuffers_[output_.index];
+    return attachedOutputDevice_;
 }
 
 size_t TensorRTInfer::outputBufferBytes() const noexcept {
@@ -380,38 +343,17 @@ int TensorRTInfer::outputHeight() const noexcept {
 }
 
 cudaStream_t TensorRTInfer::stream() const noexcept {
-    return stream_;
+    return attachedStream_;
 }
 
 void TensorRTInfer::release() noexcept {
-    if (stream_ != nullptr) {
-        // 等待指定 Stream 里此前提交的工作完成
-        cudaStreamSynchronize(stream_);
-    }
-
-    releaseDeviceBuffers();
-
-    if (stream_ != nullptr) {
-        cudaStreamDestroy(stream_);
-        stream_ = nullptr;
-    }
-
+    detachExecutionResources();
     context_.reset();
     engine_.reset();
     runtime_.reset();
 
     input_ = BindingInfo{};
     output_ = BindingInfo{};
-    hostInputScratch_.clear();
-}
-
-void TensorRTInfer::releaseDeviceBuffers() noexcept {
-    for (void* buffer : deviceBuffers_) {
-        if (buffer != nullptr) {
-            cudaFree(buffer);
-        }
-    }
-    deviceBuffers_.clear();
 }
 
 bool TensorRTInfer::hasDynamicDimension(const nvinfer1::Dims& dims) noexcept {

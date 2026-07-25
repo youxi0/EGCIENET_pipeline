@@ -1,6 +1,8 @@
 #pragma once
 
 #include "acquisition/ImageSource.h"
+
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -22,6 +24,5 @@ private:
 private:
     std::string folder_path_;
     std::vector<std::string> image_paths_;
-    size_t current_index_ = 0;
-
+    std::size_t current_index_ = 0;
 };

@@ -3,7 +3,6 @@
 #include "common/PreprocessData.h"
 
 #include <cuda_runtime.h>
-#include <opencv2/core.hpp>
 
 #include <cstddef>
 
@@ -11,12 +10,21 @@ class CudaPreprocessor {
 public:
     CudaPreprocessor(int inputW, int inputH);
     explicit CudaPreprocessor(PreprocessConfig config);
-    ~CudaPreprocessor();
+    ~CudaPreprocessor() = default;
 
-    // 将 CPU 端 BGR 图像拷贝到 GPU，resize 到模型尺寸，归一化后写成 NCHW。
-    // inputBufferBytes 用于在 kernel 启动前阻止预处理尺寸误配导致的显存越界。
+    CudaPreprocessor(const CudaPreprocessor&) = delete;
+    CudaPreprocessor& operator=(const CudaPreprocessor&) = delete;
+    CudaPreprocessor(CudaPreprocessor&&) = delete;
+    CudaPreprocessor& operator=(CudaPreprocessor&&) = delete;
+
+    // 将已上传到 GPU 的 BGR 原图 resize、归一化后写成 NCHW。
+    // 原图 H2D 由获取模块负责；本类不申请、释放或同步任何显存。
     bool process(
-        const cv::Mat& image,
+        const unsigned char* imageDevice,
+        size_t imageBufferBytes,
+        int imageWidth,
+        int imageHeight,
+        size_t imageStep,
         void* inputDevice,
         size_t inputBufferBytes,
         size_t inputElementSize,
@@ -24,21 +32,6 @@ public:
         cudaStream_t stream
     );
 
-    // 返回最近一帧上传后的紧凑 BGR 设备缓冲区，供 GPU 可视化原地使用。
-    unsigned char* imageDeviceBuffer() noexcept;
-    size_t imageDeviceStep() const noexcept;
-    int imageWidth() const noexcept;
-    int imageHeight() const noexcept;
-
-private:
-    bool ensureImageBuffer(size_t bytes);
-    void release();
-
 private:
     PreprocessConfig config_;
-    unsigned char* imageDevice_ = nullptr;
-    size_t imageDeviceBytes_ = 0;
-    size_t imageDeviceStep_ = 0;
-    int imageWidth_ = 0;
-    int imageHeight_ = 0;
 };

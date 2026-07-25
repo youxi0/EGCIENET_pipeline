@@ -2,18 +2,21 @@
 
 #include <atomic>
 #include <cstddef>
+#include <limits>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
 
 // 固定容量的单生产者/单消费者环形队列。
-// 内部使用原子读写索引，不依赖互斥锁或条件变量。
+// 内部额外保留一个哨兵槽区分满和空，头尾索引始终限制在数组范围内。
 template <typename T>
 class BlockingQueue {
 public:
     explicit BlockingQueue(size_t capacity)
-        : capacity_(capacity == 0 ? 1 : capacity),
-          buffer_(capacity_) {}
+        : capacity_(normalizeCapacity(capacity)),
+          storageSize_(checkedStorageSize(capacity_)),
+          buffer_(storageSize_) {}
 
     BlockingQueue(const BlockingQueue&) = delete;
     BlockingQueue& operator=(const BlockingQueue&) = delete;
@@ -59,13 +62,14 @@ public:
         }
 
         const size_t tail = tail_.load(std::memory_order_relaxed);
+        const size_t nextTail = advance(tail);
         const size_t head = head_.load(std::memory_order_acquire);
-        if (tail - head >= capacity_) {
+        if (nextTail == head) {
             return false;
         }
 
-        buffer_[tail % capacity_] = std::move(item);
-        tail_.store(tail + 1, std::memory_order_release);
+        buffer_[tail] = std::move(item);
+        tail_.store(nextTail, std::memory_order_release);
 
         return true;
     }
@@ -84,9 +88,9 @@ public:
             return false;
         }
 
-        item = std::move(buffer_[head % capacity_]);
-        buffer_[head % capacity_] = T{};
-        head_.store(head + 1, std::memory_order_release);
+        item = std::move(buffer_[head]);
+        buffer_[head] = T{};
+        head_.store(advance(head), std::memory_order_release);
 
         return true;
     }
@@ -97,14 +101,15 @@ public:
     }
 
     // 清空缓存并重新开放队列。
+    // 只能在生产者和消费者都已退出后调用。
     void reset() {
-        stopped_.store(false, std::memory_order_release);
-        head_.store(0, std::memory_order_release);
-        tail_.store(0, std::memory_order_release);
-
         for (auto& item : buffer_) {
             item = T{};
         }
+
+        head_.store(0, std::memory_order_relaxed);
+        tail_.store(0, std::memory_order_relaxed);
+        stopped_.store(false, std::memory_order_release);
     }
 
     bool stopped() const {
@@ -120,14 +125,17 @@ public:
         const size_t head = head_.load(std::memory_order_acquire);
         const size_t tail = tail_.load(std::memory_order_acquire);
 
-        return tail - head >= capacity_;
+        return advance(tail) == head;
     }
 
     size_t size() const {
         const size_t head = head_.load(std::memory_order_acquire);
         const size_t tail = tail_.load(std::memory_order_acquire);
 
-        return tail - head;
+        if (tail >= head) {
+            return tail - head;
+        }
+        return storageSize_ - head + tail;
     }
 
     size_t capacity() const {
@@ -135,12 +143,30 @@ public:
     }
 
 private:
+    static size_t normalizeCapacity(size_t capacity) noexcept {
+        return capacity == 0 ? 1 : capacity;
+    }
+
+    static size_t checkedStorageSize(size_t capacity) {
+        if (capacity == std::numeric_limits<size_t>::max()) {
+            throw std::length_error("BlockingQueue capacity is too large");
+        }
+        return capacity + 1;
+    }
+
+    // index 最大为 storageSize_ - 1，因此加一不会越过 size_t 上限。
+    size_t advance(size_t index) const noexcept {
+        const size_t next = index + 1;
+        return next == storageSize_ ? 0 : next;
+    }
+
     static void backoff() {
         std::this_thread::yield();
     }
 
 private:
     const size_t capacity_;
+    const size_t storageSize_;
     std::vector<T> buffer_;
     std::atomic<size_t> head_{0};
     std::atomic<size_t> tail_{0};

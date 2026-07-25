@@ -47,12 +47,187 @@ struct AccuracyAccumulator {
 };
 
 struct TimingSamples {
+    std::vector<double> h2d;
     std::vector<double> preprocess;
     std::vector<double> inference;
     std::vector<double> postprocess;
     std::vector<double> visualization;
     std::vector<double> d2h;
     std::vector<double> endToEnd;
+};
+
+// 验证器在开始运行前一次性申请全部 CUDA 显存和 stream。
+class InferenceExecutionResources {
+public:
+    InferenceExecutionResources() = default;
+    ~InferenceExecutionResources() {
+        release();
+    }
+
+    InferenceExecutionResources(const InferenceExecutionResources&) = delete;
+    InferenceExecutionResources& operator=(const InferenceExecutionResources&) = delete;
+
+    bool initialize(
+        TensorRTInfer& infer,
+        SegPostprocessor& postprocessor,
+        size_t imageBufferBytes,
+        size_t maximumPixels,
+        std::string& error
+    ) {
+        if (imageBufferBytes == 0 || maximumPixels == 0 ||
+            maximumPixels > std::numeric_limits<size_t>::max() / 5) {
+            error = "invalid validation image buffer capacity";
+            return false;
+        }
+        const size_t probabilityBytes = maximumPixels * sizeof(float);
+        const size_t binaryBytes = maximumPixels * sizeof(std::uint8_t);
+        const size_t postprocessBytes = probabilityBytes + binaryBytes;
+
+        cudaError_t status = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+        if (status == cudaSuccess) {
+            status = cudaMalloc(&inputDevice_, infer.inputBufferBytes());
+        }
+        if (status == cudaSuccess) {
+            status = cudaMalloc(&outputDevice_, infer.outputBufferBytes());
+        }
+        if (status == cudaSuccess) {
+            status = cudaMalloc(
+                reinterpret_cast<void**>(&imageDevice_), imageBufferBytes);
+        }
+        if (status == cudaSuccess) {
+            status = cudaMalloc(&postprocessDevice_, postprocessBytes);
+        }
+        if (status != cudaSuccess) {
+            error = std::string("failed to initialize validation CUDA resources: ") +
+                    cudaGetErrorString(status);
+            release();
+            return false;
+        }
+        if (!infer.attachExecutionResources(
+                inputDevice_,
+                infer.inputBufferBytes(),
+                outputDevice_,
+                infer.outputBufferBytes(),
+                stream_)) {
+            error = "failed to attach validation CUDA resources";
+            release();
+            return false;
+        }
+        infer_ = &infer;
+        imageBufferBytes_ = imageBufferBytes;
+
+        float* probabilityDevice = static_cast<float*>(postprocessDevice_);
+        auto* binaryDevice = static_cast<std::uint8_t*>(postprocessDevice_) +
+                             probabilityBytes;
+        if (!postprocessor.attachOutputBuffers(
+                probabilityDevice,
+                probabilityBytes,
+                binaryDevice,
+                binaryBytes)) {
+            error = "failed to attach validation postprocessing buffer";
+            release();
+            return false;
+        }
+        postprocessor_ = &postprocessor;
+        return true;
+    }
+
+    unsigned char* imageDeviceBuffer() noexcept {
+        return imageDevice_;
+    }
+
+    size_t imageBufferBytes() const noexcept {
+        return imageBufferBytes_;
+    }
+
+    // 验证工具在预处理前直接上传原图，避免预处理器承担 H2D。
+    bool uploadImage(
+        const cv::Mat& image,
+        size_t& imageStep,
+        std::string& error
+    ) {
+        imageStep = 0;
+        if (image.empty() || image.type() != CV_8UC3 || image.cols <= 0 || image.rows <= 0 ||
+            image.cols > std::numeric_limits<int>::max() / 3) {
+            error = "image must be a non-empty CV_8UC3 BGR image";
+            return false;
+        }
+        imageStep = static_cast<size_t>(image.cols) * 3;
+        if (image.step < imageStep ||
+            static_cast<size_t>(image.rows) >
+                std::numeric_limits<size_t>::max() / imageStep) {
+            error = "invalid BGR image step or dimensions";
+            return false;
+        }
+        const size_t imageBytes = imageStep * static_cast<size_t>(image.rows);
+        if (imageDevice_ == nullptr || stream_ == nullptr || imageBytes > imageBufferBytes_) {
+            error = "image exceeds initialized validation CUDA capacity";
+            return false;
+        }
+
+        const cudaError_t status = cudaMemcpy2DAsync(
+            imageDevice_,
+            imageStep,
+            image.data,
+            image.step,
+            imageStep,
+            static_cast<size_t>(image.rows),
+            cudaMemcpyHostToDevice,
+            stream_
+        );
+        if (status != cudaSuccess) {
+            error = std::string("cudaMemcpy2DAsync H2D failed: ")
+                + cudaGetErrorString(status);
+            return false;
+        }
+        return true;
+    }
+
+private:
+    void release() noexcept {
+        if (stream_ != nullptr) {
+            cudaStreamSynchronize(stream_);
+        }
+        if (infer_ != nullptr) {
+            infer_->detachExecutionResources();
+            infer_ = nullptr;
+        }
+        if (postprocessor_ != nullptr) {
+            postprocessor_->detachOutputBuffers();
+            postprocessor_ = nullptr;
+        }
+        if (postprocessDevice_ != nullptr) {
+            cudaFree(postprocessDevice_);
+            postprocessDevice_ = nullptr;
+        }
+        if (imageDevice_ != nullptr) {
+            cudaFree(imageDevice_);
+            imageDevice_ = nullptr;
+        }
+        imageBufferBytes_ = 0;
+        if (outputDevice_ != nullptr) {
+            cudaFree(outputDevice_);
+            outputDevice_ = nullptr;
+        }
+        if (inputDevice_ != nullptr) {
+            cudaFree(inputDevice_);
+            inputDevice_ = nullptr;
+        }
+        if (stream_ != nullptr) {
+            cudaStreamDestroy(stream_);
+            stream_ = nullptr;
+        }
+    }
+
+private:
+    TensorRTInfer* infer_ = nullptr;
+    SegPostprocessor* postprocessor_ = nullptr;
+    void* inputDevice_ = nullptr;
+    void* outputDevice_ = nullptr;
+    unsigned char* imageDevice_ = nullptr;
+    size_t imageBufferBytes_ = 0;
+    void* postprocessDevice_ = nullptr;
+    cudaStream_t stream_ = nullptr;
 };
 
 // 统一转成小写，供扩展名和 engine 名称比较使用。
@@ -146,6 +321,38 @@ bool collectDataset(
     return true;
 }
 
+// 在正式验证前扫描图片尺寸，确保后续循环中不会发生任何显存扩容。
+bool inspectDatasetCapacity(
+    const std::vector<DatasetSample>& samples,
+    size_t& maximumImageBytes,
+    size_t& maximumPixels,
+    std::string& error
+) {
+    maximumImageBytes = 0;
+    maximumPixels = 0;
+    for (const DatasetSample& sample : samples) {
+        const cv::Mat image = cv::imread(sample.imagePath.string(), cv::IMREAD_COLOR);
+        if (image.empty() || image.type() != CV_8UC3 || image.cols <= 0 || image.rows <= 0 ||
+            image.cols > std::numeric_limits<int>::max() / 3) {
+            error = "failed to inspect validation image: " + sample.imagePath.string();
+            return false;
+        }
+        const size_t imageStep = static_cast<size_t>(image.cols) * 3;
+        if (image.step < imageStep ||
+            static_cast<size_t>(image.rows) >
+                std::numeric_limits<size_t>::max() / imageStep) {
+            error = "validation image size overflow: " + sample.imagePath.string();
+            return false;
+        }
+        const size_t imageBytes = imageStep * static_cast<size_t>(image.rows);
+
+        const size_t pixels = (imageBytes / imageStep) * (imageStep / 3);
+        maximumPixels = std::max(maximumPixels, pixels);
+        maximumImageBytes = std::max(maximumImageBytes, imageBytes);
+    }
+    return maximumImageBytes > 0 && maximumPixels > 0;
+}
+
 // 读取一个 BGR 图像及其灰度二值标签，并检查原始尺寸一致性。
 bool readSample(
     const DatasetSample& sample,
@@ -176,17 +383,27 @@ bool readSample(
     return true;
 }
 
-// 在同一 CUDA stream 中依次提交预处理、TensorRT 推理和后处理。
+// 在同一 CUDA stream 中依次提交 H2D、预处理、TensorRT 推理和后处理。
 bool enqueueInference(
     TensorRTInfer& infer,
+    InferenceExecutionResources& resources,
     CudaPreprocessor& preprocessor,
     SegPostprocessor& postprocessor,
     const cv::Mat& image,
     std::string& error
 ) {
+    size_t imageStep = 0;
+    if (!resources.uploadImage(image, imageStep, error)) {
+        return false;
+    }
+
     PreprocessResult preprocessResult;
     if (!preprocessor.process(
-            image,
+            resources.imageDeviceBuffer(),
+            resources.imageBufferBytes(),
+            image.cols,
+            image.rows,
+            imageStep,
             infer.inputDeviceBuffer(),
             infer.inputBufferBytes(),
             infer.inputElementSize(),
@@ -314,6 +531,7 @@ AccuracySummary finishAccuracy(
 // 对全部配对样本执行推理，并与二值标签计算精度。
 bool validateAccuracy(
     TensorRTInfer& infer,
+    InferenceExecutionResources& resources,
     CudaPreprocessor& preprocessor,
     SegPostprocessor& postprocessor,
     const std::vector<DatasetSample>& samples,
@@ -330,7 +548,8 @@ bool validateAccuracy(
         if (!readSample(samples[index], image, label, error)) {
             return false;
         }
-        if (!enqueueInference(infer, preprocessor, postprocessor, image, error)) {
+        if (!enqueueInference(
+                infer, resources, preprocessor, postprocessor, image, error)) {
             error += ": " + samples[index].imagePath.string();
             return false;
         }
@@ -361,6 +580,7 @@ bool validateAccuracy(
 // 正式计时前运行完整链路，使显存、CUDA 上下文和 TensorRT 状态稳定。
 bool runWarmup(
     TensorRTInfer& infer,
+    InferenceExecutionResources& resources,
     CudaPreprocessor& preprocessor,
     SegPostprocessor& postprocessor,
     Visualizer& visualizer,
@@ -381,14 +601,16 @@ bool runWarmup(
                 + samples[index % samples.size()].imagePath.string();
             return false;
         }
-        if (!enqueueInference(infer, preprocessor, postprocessor, image, error)) {
+        if (!enqueueInference(
+                infer, resources, preprocessor, postprocessor, image, error)) {
             return false;
         }
+        const size_t imageStep = static_cast<size_t>(image.cols) * 3;
         if (config.includeVisualization && !visualizer.process(
-                preprocessor.imageDeviceBuffer(),
-                preprocessor.imageDeviceStep(),
-                preprocessor.imageWidth(),
-                preprocessor.imageHeight(),
+                resources.imageDeviceBuffer(),
+                imageStep,
+                image.cols,
+                image.rows,
                 postprocessor.probabilityDeviceBuffer(),
                 postprocessor.binaryDeviceBuffer(),
                 infer.stream())) {
@@ -400,10 +622,10 @@ bool runWarmup(
             return false;
         }
         if (config.includeVisualization && !visualizer.enqueueDownload(
-                preprocessor.imageDeviceBuffer(),
-                preprocessor.imageDeviceStep(),
-                preprocessor.imageWidth(),
-                preprocessor.imageHeight(),
+                resources.imageDeviceBuffer(),
+                imageStep,
+                image.cols,
+                image.rows,
                 visualizedImage,
                 infer.stream())) {
             error = "failed to enqueue warmup visualization D2H";
@@ -429,6 +651,7 @@ bool timerValue(CudaEventTimer& timer, double& value, std::string& error) {
 // 分阶段记录 GPU 时间，并记录不含图像解码的串行端到端时间。
 bool benchmarkPerformance(
     TensorRTInfer& infer,
+    InferenceExecutionResources& resources,
     CudaPreprocessor& preprocessor,
     SegPostprocessor& postprocessor,
     Visualizer& visualizer,
@@ -438,22 +661,24 @@ bool benchmarkPerformance(
     std::string& error
 ) {
     if (!runWarmup(
-            infer, preprocessor, postprocessor, visualizer, samples, config, error)) {
+            infer, resources, preprocessor, postprocessor, visualizer, samples, config, error)) {
         return false;
     }
 
+    CudaEventTimer h2dTimer(infer.stream());
     CudaEventTimer preprocessTimer(infer.stream());
     CudaEventTimer inferenceTimer(infer.stream());
     CudaEventTimer postprocessTimer(infer.stream());
     CudaEventTimer visualizationTimer(infer.stream());
     CudaEventTimer d2hTimer(infer.stream());
-    if (!preprocessTimer.isValid() || !inferenceTimer.isValid() ||
+    if (!h2dTimer.isValid() || !preprocessTimer.isValid() || !inferenceTimer.isValid() ||
         !postprocessTimer.isValid() || !visualizationTimer.isValid() ||
         !d2hTimer.isValid()) {
         error = "failed to create CUDA event timers";
         return false;
     }
 
+    timings.h2d.reserve(config.benchmarkIterations);
     timings.preprocess.reserve(config.benchmarkIterations);
     timings.inference.reserve(config.benchmarkIterations);
     timings.postprocess.reserve(config.benchmarkIterations);
@@ -476,12 +701,23 @@ bool benchmarkPerformance(
 
         CpuTimer endToEndTimer;
         PreprocessResult preprocessResult;
+        size_t imageStep = 0;
+        if (!h2dTimer.start() ||
+            !resources.uploadImage(image, imageStep, error) ||
+            !h2dTimer.stop()) {
+            error = error.empty() ? "CUDA H2D failed during benchmark" : error;
+            return false;
+        }
         if (!preprocessTimer.start()) {
             error = "failed to start preprocessing timer";
             return false;
         }
         const bool preprocessOk = preprocessor.process(
-            image,
+            resources.imageDeviceBuffer(),
+            resources.imageBufferBytes(),
+            image.cols,
+            image.rows,
+            imageStep,
             infer.inputDeviceBuffer(),
             infer.inputBufferBytes(),
             infer.inputElementSize(),
@@ -526,10 +762,10 @@ bool benchmarkPerformance(
                 return false;
             }
             const bool visualizationOk = visualizer.process(
-                preprocessor.imageDeviceBuffer(),
-                preprocessor.imageDeviceStep(),
-                preprocessor.imageWidth(),
-                preprocessor.imageHeight(),
+                resources.imageDeviceBuffer(),
+                imageStep,
+                image.cols,
+                image.rows,
                 postprocessor.probabilityDeviceBuffer(),
                 postprocessor.binaryDeviceBuffer(),
                 infer.stream());
@@ -547,10 +783,10 @@ bool benchmarkPerformance(
             probabilityMask, binaryMask, infer.stream());
         const bool visualizationDownloadOk = !config.includeVisualization ||
             visualizer.enqueueDownload(
-                preprocessor.imageDeviceBuffer(),
-                preprocessor.imageDeviceStep(),
-                preprocessor.imageWidth(),
-                preprocessor.imageHeight(),
+                resources.imageDeviceBuffer(),
+                imageStep,
+                image.cols,
+                image.rows,
                 visualizedImage,
                 infer.stream());
         if (!d2hTimer.stop() || !maskDownloadOk || !visualizationDownloadOk) {
@@ -563,6 +799,10 @@ bool benchmarkPerformance(
         timings.endToEnd.push_back(endToEndTimer.elapsedMs());
 
         double value = 0.0;
+        if (!timerValue(h2dTimer, value, error)) {
+            return false;
+        }
+        timings.h2d.push_back(value);
         if (!timerValue(preprocessTimer, value, error)) {
             return false;
         }
@@ -619,6 +859,7 @@ TimingDistribution summarizeTiming(std::vector<double> values) {
 // 汇总所有阶段耗时，并计算单 stream 串行 FPS。
 PerformanceSummary finishPerformance(TimingSamples timings) {
     PerformanceSummary summary;
+    summary.h2d = summarizeTiming(std::move(timings.h2d));
     summary.preprocess = summarizeTiming(std::move(timings.preprocess));
     summary.inference = summarizeTiming(std::move(timings.inference));
     summary.postprocess = summarizeTiming(std::move(timings.postprocess));
@@ -674,6 +915,7 @@ bool writeCsv(
 
     output << "engine,engine_path,images,pixels,global_dice,mean_dice,"
               "global_iou,mean_iou,precision,recall,mae,rmse,"
+              "h2d_mean_ms,h2d_p50_ms,h2d_p95_ms,h2d_p99_ms,"
               "pre_mean_ms,pre_p50_ms,pre_p95_ms,pre_p99_ms,"
               "infer_mean_ms,infer_p50_ms,infer_p95_ms,infer_p99_ms,"
               "post_mean_ms,post_p50_ms,post_p95_ms,post_p99_ms,"
@@ -704,6 +946,7 @@ bool writeCsv(
                << ',' << result.accuracy.recall
                << ',' << result.accuracy.mae
                << ',' << result.accuracy.rmse;
+        writeTiming(output, result.performance.h2d);
         writeTiming(output, result.performance.preprocess);
         writeTiming(output, result.performance.inference);
         writeTiming(output, result.performance.postprocess);
@@ -774,6 +1017,12 @@ bool EngineValidator::run(
     if (!collectDataset(config_, samples, lastError_)) {
         return false;
     }
+    size_t maximumImageBytes = 0;
+    size_t maximumPixels = 0;
+    if (!inspectDatasetCapacity(
+            samples, maximumImageBytes, maximumPixels, lastError_)) {
+        return false;
+    }
     std::cout << "[Validate] paired samples: " << samples.size() << std::endl;
 
     for (const EngineValidationTarget& target : targets) {
@@ -802,12 +1051,22 @@ bool EngineValidator::run(
         CudaPreprocessor preprocessor(preprocessConfig);
         SegPostprocessor postprocessor({config_.maskThreshold});
         Visualizer visualizer;
+        InferenceExecutionResources executionResources;
+        if (!executionResources.initialize(
+                infer,
+                postprocessor,
+                maximumImageBytes,
+                maximumPixels,
+                lastError_)) {
+            return false;
+        }
 
         EngineValidationResult result;
         result.name = target.name;
         result.enginePath = target.enginePath;
         if (!validateAccuracy(
                 infer,
+                executionResources,
                 preprocessor,
                 postprocessor,
                 samples,
@@ -823,6 +1082,7 @@ bool EngineValidator::run(
         TimingSamples timings;
         if (!benchmarkPerformance(
                 infer,
+                executionResources,
                 preprocessor,
                 postprocessor,
                 visualizer,

@@ -48,10 +48,10 @@ public:
     // 如果已有校准 cache，允许 TensorRT 复用。
     const void* readCalibrationCache(size_t& length) noexcept override;
 
-    // 首次校准后保存 TensorRT 生成的校准表。
+    // 保存 TensorRT 生成的校准表。
     void writeCalibrationCache(const void* cache, size_t length) noexcept override;
 
-    // 表示构造阶段是否成功收集图片或找到可复用 cache。
+    // 表示是否已准备好校准 batch 缓冲区，或找到可复用 cache。
     bool isValid() const noexcept;
 
     // 返回构造或校准回调期间捕获的最近错误。
@@ -67,19 +67,19 @@ private:
     // 分配 host staging batch 和 TensorRT device 输入 buffer。
     bool allocateDeviceBuffer();
 
-    // 加载并预处理图片，直到组成一个固定大小的校准 batch。
+    // 加载并预处理图片；最后不足一个 batch 时复制末张有效图补齐。
     bool prepareBatch(size_t& validImageCount);
 
     // 读取单张图片，预处理成 BGR NCHW FP32，并拷贝到 hostBatch_。
     bool copyImageToBatch(const std::string& imagePath, size_t batchIndex);
 
-    // 检查图片扩展名是否为 OpenCV 支持的格式。
+    // 检查图片扩展名是否属于 jpg/jpeg/png/bmp/tif/tiff 白名单。
     bool isSupportedImage(const std::string& path) const;
 
     // 查找 inputTensorName 对应的 TensorRT binding。
     int findInputBinding(const char* names[], int nbBindings) const;
 
-    // 检查磁盘上是否存在非空且可读的校准 cache。
+    // 检查磁盘上是否存在非空的普通文件；实际读取由 readCalibrationCache 完成。
     bool hasReadableCache() const;
 
     // 保存并记录最近一次校准错误。

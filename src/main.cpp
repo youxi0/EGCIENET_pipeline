@@ -2,87 +2,180 @@
 #include "acquisition/ImageSource.h"
 #include "acquisition/VideoSource.h"
 #include "pipeline/InspectionPipeline.h"
+#include "utils/FileLogger.h"
 
+#include <opencv2/imgcodecs.hpp>
+
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
-#include <vector>
-
-// getArg() 负责取参数
-//    ↓
-// splitClasses() 负责拆类别
-//    ↓
-// main() 根据这些参数创建：
-//    - TensorRTInfer
-//    - ImageFolderSource / VideoSource / CameraSource
-//    - TCP Server
-//      while(gRunning)
-//      - 读图
-//      - 推理
-//      - 后处理
-//      - 发送结果
+#include <utility>
 
 namespace {
 
 std::atomic<bool> gRunning{true};
 
 void handleSignal(int) {
-    gRunning = false;
+    gRunning.store(false, std::memory_order_release);
 }
 
-// 把命令行里传进来的类别字符串拆开
-std::vector<std::string> splitClasses(const std::string& text) {
-    std::vector<std::string> classes;
-    std::stringstream ss(text);
-    std::string item;
-    // 从字符串流 ss 里面读内容，每次遇到逗号 , 就切一段
-    while (std::getline(ss, item, ',')) {
-        if (!item.empty()) {
-            classes.push_back(item);
-        }
-    }
-
-    if (classes.empty()) {
-        classes.push_back("defect");
-    }
-
-    return classes;
-}
-
-void printUsage(const char* app) {
-    std::cout << "Usage:\n"
-              << "  " << app << " --engine best.engine --source ./images --type folder --port 9000 --classes scratch,crack\n"
-              << "  " << app << " --engine best.engine --source ./test.mp4 --type video --port 9000 --classes scratch,crack\n"
-              << "  " << app << " --engine best.engine --source 0 --type camera --port 9000 --classes scratch,crack\n\n"
-              << "Options:\n"
-              << "  --engine   TensorRT engine path\n"
-              << "  --source   image folder / video path / camera id\n"
-              << "  --type     folder | video | camera\n"
-              << "  --port     TCP listen port, default 9000\n"
-              << "  --classes  comma separated class names, default defect\n"
-              << "  --save_baseline  0 | 1, default 1\n"
-              << "  --baseline_dir  baseline output dir, default results/baseline_fp16\n"
-              << "  --log_dir       log output dir, default results/logs\n"
-              << "  --enable_int8_compare  0 | 1, default 0\n"
-              << "  --int8_engine          INT8 TensorRT engine path\n"
-              << "  --compare_dir          FP16 vs INT8 output dir, default results/compare_fp16_int8\n"
-              << "  --compare_iou          box IoU threshold, default 0.5\n"
-              << "  --compare_min_match    minimum match rate, default 0.95\n"
-              << "  --compare_max_score_diff  maximum mean score diff, default 0.10\n";
-}
-
-std::string getArg(int argc, char** argv, const std::string& key, const std::string& defaultValue = "") {
-    for (int i = 1; i + 1 < argc; ++i) {
-        if (argv[i] == key) {
-            return argv[i + 1];
+std::string getArg(
+    int argc,
+    char** argv,
+    const std::string& key,
+    const std::string& defaultValue = ""
+) {
+    for (int index = 1; index + 1 < argc; ++index) {
+        if (argv[index] == key) {
+            return argv[index + 1];
         }
     }
     return defaultValue;
+}
+
+// 解析 BGR 顺序的三通道参数，例如 140.505,157.845,135.66。
+std::array<float, 3> parseTriplet(
+    const std::string& text,
+    const char* argumentName
+) {
+    std::array<float, 3> values{};
+    std::istringstream stream(text);
+    std::string item;
+
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (!std::getline(stream, item, ',') || item.empty()) {
+            throw std::invalid_argument(
+                std::string(argumentName) + " must contain three comma-separated values");
+        }
+
+        std::size_t consumed = 0;
+        values[index] = std::stof(item, &consumed);
+        if (consumed != item.size()) {
+            throw std::invalid_argument(std::string(argumentName) + " contains invalid value");
+        }
+    }
+
+    if (std::getline(stream, item, ',')) {
+        throw std::invalid_argument(
+            std::string(argumentName) + " must contain exactly three values");
+    }
+    return values;
+}
+
+std::size_t parseQueueSize(const std::string& text) {
+    std::size_t consumed = 0;
+    const unsigned long long value = std::stoull(text, &consumed);
+    if (consumed != text.size() || value == 0 || value > 16) {
+        throw std::invalid_argument("--queue_size must be in [1, 16]");
+    }
+    return static_cast<std::size_t>(value);
+}
+
+int parsePositiveDimension(const std::string& text, const char* argumentName) {
+    std::size_t consumed = 0;
+    const int value = std::stoi(text, &consumed);
+    if (consumed != text.size() || value <= 0) {
+        throw std::invalid_argument(
+            std::string(argumentName) + " must be a positive integer");
+    }
+    return value;
+}
+
+float parseThreshold(const std::string& text) {
+    std::size_t consumed = 0;
+    const float value = std::stof(text, &consumed);
+    if (consumed != text.size() || value < 0.0f || value > 1.0f) {
+        throw std::invalid_argument("--threshold must be in [0, 1]");
+    }
+    return value;
+}
+
+std::unique_ptr<ImageSource> createSource(
+    const std::string& sourceType,
+    const std::string& sourcePath
+) {
+    if (sourceType == "folder") {
+        return std::make_unique<ImageFolderSource>(sourcePath);
+    }
+    if (sourceType == "video") {
+        return std::make_unique<VideoSource>(sourcePath);
+    }
+    if (sourceType == "camera") {
+        std::size_t consumed = 0;
+        const int cameraId = std::stoi(sourcePath, &consumed);
+        if (consumed != sourcePath.size() || cameraId < 0) {
+            throw std::invalid_argument("camera source must be a non-negative integer");
+        }
+        return std::make_unique<VideoSource>(cameraId);
+    }
+    throw std::invalid_argument("--type must be folder, video or camera");
+}
+
+void printUsage(const char* app) {
+    std::cout
+        << "Usage:\n"
+        << "  " << app
+        << " --engine models/egcinet_352_fp16.engine"
+        << " --source datasets/images/val --type folder [options]\n\n"
+        << "Options:\n"
+        << "  --type         folder | video | camera, default folder\n"
+        << "  --queue_size   frame slot count, range 1-16, default 3\n"
+        << "  --max_width    maximum source width, default 1920\n"
+        << "  --max_height   maximum source height, default 1080\n"
+        << "  --threshold    binary mask threshold, default 0.5\n"
+        << "  --mean         B,G,R raw-pixel mean, default 140.505,157.845,135.66\n"
+        << "  --std          B,G,R raw-pixel std, default 61.455,60.18,62.22\n"
+        << "  --save_dir     save binary/probability masks; empty means disabled\n"
+        << "  --log_dir      runtime log directory, default results/logs\n";
+}
+
+std::string frameStem(std::uint64_t frameId) {
+    std::ostringstream stream;
+    stream << "frame_" << std::setw(8) << std::setfill('0') << frameId;
+    return stream.str();
+}
+
+// 结果回调位于完成线程，保存图像会对槽位回收和后续帧产生背压。
+void handleResult(const FrameData& frame, const std::string& saveDirectory) {
+    std::ostringstream timingLog;
+    timingLog << std::fixed << std::setprecision(3)
+              << "[Pipeline] frame=" << frame.frameId
+              << " acquire=" << frame.cost.acquire_ms << " ms"
+              << " h2d=" << frame.cost.h2d_ms << " ms"
+              << " preprocess=" << frame.cost.preprocess_ms << " ms"
+              << " infer=" << frame.cost.infer_ms << " ms"
+              << " postprocess=" << frame.cost.postprocess_ms << " ms"
+              << " d2h=" << frame.cost.d2h_ms << " ms"
+              << " total=" << frame.cost.total_ms << " ms";
+    utils::FileLogger::instance().info(timingLog.str());
+
+    if (saveDirectory.empty()) {
+        return;
+    }
+
+    const std::filesystem::path outputDirectory(saveDirectory);
+    const std::string stem = frameStem(frame.frameId);
+    const std::filesystem::path binaryPath = outputDirectory / (stem + "_binary.png");
+    const std::filesystem::path probabilityPath =
+        outputDirectory / (stem + "_probability.png");
+
+    cv::Mat probabilityImage;
+    frame.probabilityMask.convertTo(probabilityImage, CV_8U, 255.0);
+    if (!cv::imwrite(binaryPath.string(), frame.binaryMask) ||
+        !cv::imwrite(probabilityPath.string(), probabilityImage)) {
+        throw std::runtime_error("failed to save output masks for frame "
+            + std::to_string(frame.frameId));
+    }
 }
 
 } // namespace
@@ -91,79 +184,81 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
 
-    std::string enginePath = getArg(argc, argv, "--engine");
-    std::string sourcePath = getArg(argc, argv, "--source");
-    std::string sourceType = getArg(argc, argv, "--type", "folder");
-    std::string classText = getArg(argc, argv, "--classes", "defect");
-    bool saveBaseline = getArg(argc, argv, "--save_baseline", "1") == "1";
-    std::string baselineDir = getArg(argc, argv, "--baseline_dir", "results/baseline_fp16");
-    std::string logDir = getArg(argc, argv, "--log_dir", "results/logs");
-    bool enableInt8Compare = getArg(argc, argv, "--enable_int8_compare", "0") == "1";
-    std::string int8EnginePath = getArg(argc, argv, "--int8_engine");
-    std::string compareDir = getArg(argc, argv, "--compare_dir", "results/compare_fp16_int8");
-    float compareIouThreshold = std::stof(getArg(argc, argv, "--compare_iou", "0.5"));
-    float compareMinMatchRate = std::stof(getArg(argc, argv, "--compare_min_match", "0.95"));
-    float compareMaxMeanScoreDiff = std::stof(getArg(argc, argv, "--compare_max_score_diff", "0.10"));
-    uint16_t port = static_cast<uint16_t>(std::stoi(getArg(argc, argv, "--port", "9000")));
-
+    const std::string enginePath = getArg(argc, argv, "--engine");
+    const std::string sourcePath = getArg(argc, argv, "--source");
     if (enginePath.empty() || sourcePath.empty()) {
         printUsage(argv[0]);
         return 1;
     }
 
-    std::unique_ptr<ImageSource> source;
+    try {
+        const std::string sourceType = getArg(argc, argv, "--type", "folder");
+        const std::string saveDirectory = getArg(argc, argv, "--save_dir");
+        const std::string logDirectory =
+            getArg(argc, argv, "--log_dir", "results/logs");
 
-    if (sourceType == "folder") {
-        source = std::make_unique<ImageFolderSource>(sourcePath);
-    }
-    else if (sourceType == "video") {
-        source = std::make_unique<VideoSource>(sourcePath);
-    }
-    else if (sourceType == "camera") {
-        source = std::make_unique<VideoSource>(std::stoi(sourcePath));
-    }
-    else {
-        std::cerr << "Unknown source type: " << sourceType << std::endl;
-        printUsage(argv[0]);
+        if (!saveDirectory.empty()) {
+            std::filesystem::create_directories(saveDirectory);
+        }
+        if (!utils::FileLogger::instance().open(
+                logDirectory, "egcinet_pipeline")) {
+            return 1;
+        }
+
+        egcinet::pipeline::PipelineConfig config;
+        config.enginePath = enginePath;
+        config.queueSize = parseQueueSize(getArg(argc, argv, "--queue_size", "3"));
+        config.maxSourceWidth = parsePositiveDimension(
+            getArg(argc, argv, "--max_width", "1920"), "--max_width");
+        config.maxSourceHeight = parsePositiveDimension(
+            getArg(argc, argv, "--max_height", "1080"), "--max_height");
+        config.maskThreshold = parseThreshold(getArg(argc, argv, "--threshold", "0.5"));
+        config.mean = parseTriplet(
+            getArg(argc, argv, "--mean", "140.505,157.845,135.66"),
+            "--mean");
+        config.std = parseTriplet(
+            getArg(argc, argv, "--std", "61.455,60.18,62.22"),
+            "--std");
+        config.resultCallback = [saveDirectory](const FrameData& frame) {
+            handleResult(frame, saveDirectory);
+        };
+
+        std::ostringstream startupLog;
+        startupLog << "[Pipeline] configuration: engine=" << enginePath
+                   << ", source=" << sourcePath
+                   << ", type=" << sourceType
+                   << ", slots=" << config.queueSize
+                   << ", max_source=" << config.maxSourceWidth << "x"
+                   << config.maxSourceHeight
+                   << ", threshold=" << config.maskThreshold;
+        utils::FileLogger::instance().info(startupLog.str());
+
+        auto source = createSource(sourceType, sourcePath);
+        egcinet::pipeline::InspectionPipeline pipeline(std::move(source), std::move(config));
+        if (!pipeline.start()) {
+            return 1;
+        }
+
+        utils::FileLogger::instance().info(
+            "[Pipeline] running, press Ctrl+C to stop");
+        while (gRunning.load(std::memory_order_acquire) && pipeline.isRunning()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        pipeline.stop();
+        const std::string pipelineError = pipeline.lastError();
+        utils::FileLogger::instance().info(
+            "[Pipeline] processed frames: " +
+            std::to_string(pipeline.processedFrames()));
+        if (!pipelineError.empty()) {
+            return 1;
+        }
+    } catch (const std::exception& exception) {
+        utils::FileLogger::instance().error(
+            std::string("[Pipeline] invalid argument or runtime error: ") +
+            exception.what());
         return 1;
     }
 
-    blade::pipeline::PipelineConfig config;
-    config.enginePath = enginePath;
-    config.listenPort = port;
-    config.classNames = splitClasses(classText);
-    config.inputWidth = 640;
-    config.inputHeight = 640;
-    config.confThreshold = 0.25f;
-    config.nmsThreshold = 0.45f;
-    config.maskThreshold = 0.5f;
-    config.jpegQuality = 85;
-    config.queueSize = 4;
-    config.heartbeatIntervalMs = 2000;
-    config.heartbeatTimeoutMs = 8000;
-    config.saveBaseline = saveBaseline;
-    config.baselineDir = baselineDir;
-    config.logDir = logDir;
-    config.enableInt8Compare = enableInt8Compare;
-    config.int8EnginePath = int8EnginePath;
-    config.compareDir = compareDir;
-    config.compareIouThreshold = compareIouThreshold;
-    config.compareMinMatchRate = compareMinMatchRate;
-    config.compareMaxMeanScoreDiff = compareMaxMeanScoreDiff;
-
-    blade::pipeline::InspectionPipeline pipeline(std::move(source), config);
-
-    if (!pipeline.start()) {
-        std::cerr << "Failed to start inspection pipeline." << std::endl;
-        return 1;
-    }
-
-    std::cout << "Inspection pipeline is running. Press Ctrl+C to exit." << std::endl;
-
-    while (gRunning && pipeline.isRunning()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-
-    pipeline.stop();
     return 0;
 }

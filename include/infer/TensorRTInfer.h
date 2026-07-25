@@ -2,9 +2,7 @@
 
 #include "infer/TensorRTCommon.h"
 
-#include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
-#include <opencv2/core.hpp>
 
 #include <cstddef>
 #include <memory>
@@ -16,12 +14,13 @@ struct TensorRTInferConfig {
     std::string inputTensorName = "image";
     std::string outputTensorName = "mask";
 
-    // 动态 engine 使用该形状；静态 engine 也会据此校验模型契约。
+    // 动态 engine 使用该形状设置输入 binding；静态 engine 据此校验输入形状。
     nvinfer1::Dims4 inputShape{1, 3, 352, 352};
 };
 
-// EGCINET TensorRT 推理封装。
-// 一个实例持有一套执行上下文、CUDA 流和复用显存，不支持多线程并发调用。
+// EGCINET TensorRT 执行封装。
+// 本类只拥有 TensorRT runtime、engine、context 和 binding 元数据，
+// 不创建 CUDA stream，也不申请或释放输入输出显存。
 class TensorRTInfer {
 public:
     explicit TensorRTInfer(std::string enginePath);
@@ -33,36 +32,55 @@ public:
     TensorRTInfer(TensorRTInfer&&) = delete;
     TensorRTInfer& operator=(TensorRTInfer&&) = delete;
 
-    // 反序列化 engine，并一次性分配输入、输出显存。
+    // 反序列化 engine、创建 execution context，并解析输入输出 binding。
     bool load();
     bool isLoaded() const noexcept;
 
-    // CPU 路径：上传连续的 FP32 NCHW blob，然后异步提交推理。
-    bool infer(const cv::Mat& inputBlob);
+    // 为单图和验证工具挂接调用方拥有的显存与 stream；本类不接管所有权。
+    bool attachExecutionResources(
+        void* inputDevice,
+        size_t inputBufferBytes,
+        void* outputDevice,
+        size_t outputBufferBytes,
+        cudaStream_t stream
+    ) noexcept;
 
-    // CUDA 预处理已在本实例的 stream 上写入输入显存时，异步提交推理。
+    // 清除非拥有资源引用，不同步 stream，也不释放显存。
+    void detachExecutionResources() noexcept;
+
+    // 使用已挂接资源异步提交推理，不执行同步或 D2H。
     bool inferFromDevice();
 
-    // CUDA 预处理模块通过以下接口直接写入 TensorRT 输入显存。
+    // Pipeline 路径：使用调用方给定的输入输出显存和 stream 异步提交推理。
+    // 调用方负责前置依赖、buffer 生命周期以及销毁 context 前的 stream 同步。
+    bool inferFromDeviceBuffers(
+        void* inputDevice,
+        size_t inputBufferBytes,
+        void* outputDevice,
+        size_t outputBufferBytes,
+        cudaStream_t stream
+    );
+
+    // 以下指针和 stream 来自 attachExecutionResources，本类不拥有它们。
     void* inputDeviceBuffer() noexcept;
+    void* outputDeviceBuffer() noexcept;
+    const void* outputDeviceBuffer() const noexcept;
+    cudaStream_t stream() const noexcept;
+
     size_t inputBufferBytes() const noexcept;
     nvinfer1::DataType inputDataType() const noexcept;
     size_t inputElementSize() const noexcept;
     int inputWidth() const noexcept;
     int inputHeight() const noexcept;
 
-    // 后处理模块通过以下接口直接读取 TensorRT 输出显存。
-    const void* outputDeviceBuffer() const noexcept;
     size_t outputBufferBytes() const noexcept;
     nvinfer1::DataType outputDataType() const noexcept;
     size_t outputElementSize() const noexcept;
     int outputWidth() const noexcept;
     int outputHeight() const noexcept;
 
-    cudaStream_t stream() const noexcept;
-
 private:
-    // 保存单个 binding 的运行时形状、类型和显存大小。
+    // 保存单个 binding 的运行时形状、类型和所需显存大小。
     struct BindingInfo {
         int index = -1;
         std::string name;
@@ -72,29 +90,20 @@ private:
         size_t bytes = 0;
     };
 
-    // 从磁盘完整读取序列化 engine。
     bool readEngineFile(std::vector<char>& engineData) const;
-
-    // 创建 TensorRT runtime、engine、context 和非阻塞 CUDA 流。
     bool createRuntimeObjects(const std::vector<char>& engineData);
-
-    // 按名称解析 binding，并校验 EGCINET 的输入输出契约。
     bool inspectBindings();
 
-    // 根据实际 binding 形状一次性申请输入输出显存。
-    bool allocateDeviceBuffers();
+    // 使用栈上的 binding 指针表提交推理，不进行资源申请、同步或 D2H。
+    bool enqueue(
+        void* inputDevice,
+        void* outputDevice,
+        cudaStream_t stream
+    );
 
-    // 校验 CPU blob 的数据类型、内存连续性和 NCHW 形状。
-    bool validateInputBlob(const cv::Mat& inputBlob) const;
-
-    // 只提交 TensorRT 推理，输出保留在 output binding 显存中。
-    bool enqueue();
-
-    // 按 CUDA、TensorRT 的依赖顺序释放运行时资源。
+    // 仅释放本类拥有的 TensorRT 对象，不接触调用方 CUDA 资源。
     void release() noexcept;
-    void releaseDeviceBuffers() noexcept;
 
-    // 以下工具函数用于维度和 buffer 大小的安全计算。
     static bool hasDynamicDimension(const nvinfer1::Dims& dims) noexcept;
     static bool sameDimensions(const nvinfer1::Dims& lhs, const nvinfer1::Dims& rhs) noexcept;
     static size_t elementCount(const nvinfer1::Dims& dims) noexcept;
@@ -108,11 +117,11 @@ private:
     std::unique_ptr<nvinfer1::ICudaEngine, TrtDestroy<nvinfer1::ICudaEngine>> engine_;
     std::unique_ptr<nvinfer1::IExecutionContext, TrtDestroy<nvinfer1::IExecutionContext>> context_;
 
-    cudaStream_t stream_ = nullptr;
     BindingInfo input_;
     BindingInfo output_;
-    std::vector<void*> deviceBuffers_;
 
-    // CPU 路径的 FP16 输入转换使用可复用暂存区。
-    std::vector<__half> hostInputScratch_;
+    // 以下资源均为非拥有引用，仅用于兼容单图和验证工具。
+    void* attachedInputDevice_ = nullptr;
+    void* attachedOutputDevice_ = nullptr;
+    cudaStream_t attachedStream_ = nullptr;
 };

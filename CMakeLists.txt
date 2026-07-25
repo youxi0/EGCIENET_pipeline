@@ -92,6 +92,7 @@ if(EGCINET_BUILD_PIPELINE)
         src/common/Timer.cpp
         src/infer/TensorRTCommon.cpp
         src/infer/TensorRTInfer.cpp
+        src/pipeline/InspectionPipeline.cpp
         src/postprocess/SegPostprocessor.cpp
         src/postprocess/SegPostprocessKernel.cu
         src/preprocess/CudaPreprocessor.cpp
@@ -116,6 +117,7 @@ if(EGCINET_BUILD_PIPELINE)
 
     set_target_properties(egcinet_runtime PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
         ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
     )
 
@@ -144,6 +146,18 @@ if(EGCINET_BUILD_PIPELINE)
     )
 
     set_target_properties(egcinet_infer_image PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+
+    add_executable(egcinet_pipeline
+        src/main.cpp
+    )
+
+    target_link_libraries(egcinet_pipeline PRIVATE
+        egcinet_runtime
+    )
+
+    set_target_properties(egcinet_pipeline PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 

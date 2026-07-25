@@ -29,56 +29,20 @@ CudaPreprocessor::CudaPreprocessor(int inputW, int inputH)
 CudaPreprocessor::CudaPreprocessor(PreprocessConfig config)
     : config_(config) {}
 
-CudaPreprocessor::~CudaPreprocessor() {
-    release();
-}
-
-void CudaPreprocessor::release() {
-    if (imageDevice_) {
-        cudaFree(imageDevice_);
-        imageDevice_ = nullptr;
-        imageDeviceBytes_ = 0;
-    }
-
-    imageDeviceStep_ = 0;
-    imageWidth_ = 0;
-    imageHeight_ = 0;
-}
-
-bool CudaPreprocessor::ensureImageBuffer(size_t bytes) {
-    if (bytes <= imageDeviceBytes_) {
-        return true;
-    }
-
-    release();
-
-    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&imageDevice_), bytes);
-
-    if (err != cudaSuccess) {
-        std::cerr << "[CUDA Preprocess] cudaMalloc image buffer failed: "
-                  << cudaGetErrorString(err)
-                  << std::endl;
-        return false;
-    }
-
-    imageDeviceBytes_ = bytes;
-    return true;
-}
-
 bool CudaPreprocessor::process(
-    const cv::Mat& image,
+    const unsigned char* imageDevice,
+    size_t imageBufferBytes,
+    int imageWidth,
+    int imageHeight,
+    size_t imageStep,
     void* inputDevice,
     size_t inputBufferBytes,
     size_t inputElementSize,
     PreprocessResult& prep,
     cudaStream_t stream
 ) {
-    imageDeviceStep_ = 0;
-    imageWidth_ = 0;
-    imageHeight_ = 0;
-
-    if (image.empty()) {
-        std::cerr << "[CUDA Preprocess] input image is empty" << std::endl;
+    if (imageDevice == nullptr || imageWidth <= 0 || imageHeight <= 0 || stream == nullptr) {
+        std::cerr << "[CUDA Preprocess] invalid GPU image or CUDA stream" << std::endl;
         return false;
     }
 
@@ -91,11 +55,6 @@ bool CudaPreprocessor::process(
     if (inputElementSize != sizeof(float) && inputElementSize != sizeof(__half)) {
         std::cerr << "[CUDA Preprocess] unsupported TensorRT input element size: "
                   << inputElementSize << std::endl;
-        return false;
-    }
-
-    if (image.type() != CV_8UC3) {
-        std::cerr << "[CUDA Preprocess] only CV_8UC3 image is supported" << std::endl;
         return false;
     }
 
@@ -125,55 +84,35 @@ bool CudaPreprocessor::process(
         return false;
     }
 
-    prep.originalWidth = image.cols;
-    prep.originalHeight = image.rows;
-    prep.inputWidth = config_.inputWidth;
-    prep.inputHeight = config_.inputHeight;
-    prep.scaleX = static_cast<float>(config_.inputWidth) / static_cast<float>(image.cols);
-    prep.scaleY = static_cast<float>(config_.inputHeight) / static_cast<float>(image.rows);
-    prep.blob.release();
-
-    if (image.cols > std::numeric_limits<int>::max() / 3) {
+    if (imageWidth > std::numeric_limits<int>::max() / 3) {
         std::cerr << "[CUDA Preprocess] image row is too large" << std::endl;
         return false;
     }
 
-    const size_t packedStep = static_cast<size_t>(image.cols) * 3;
-    if (image.step < packedStep ||
-        static_cast<size_t>(image.rows) > std::numeric_limits<size_t>::max() / packedStep) {
-        std::cerr << "[CUDA Preprocess] invalid image step or size" << std::endl;
-        return false;
-    }
-
-    const size_t imageBytes = packedStep * static_cast<size_t>(image.rows);
-
-    if (!ensureImageBuffer(imageBytes)) {
-        return false;
-    }
-
-    cudaError_t err = cudaMemcpy2DAsync(
-        imageDevice_,
-        packedStep,
-        image.data,
-        image.step,
-        packedStep,
-        static_cast<size_t>(image.rows),
-        cudaMemcpyHostToDevice,
-        stream
-    );
-
-    if (err != cudaSuccess) {
-        std::cerr << "[CUDA Preprocess] cudaMemcpy2DAsync H2D failed: "
-                  << cudaGetErrorString(err)
+    const size_t packedStep = static_cast<size_t>(imageWidth) * 3;
+    if (imageStep < packedStep ||
+        static_cast<size_t>(imageHeight) >
+            std::numeric_limits<size_t>::max() / imageStep ||
+        imageStep * static_cast<size_t>(imageHeight) > imageBufferBytes ||
+        imageStep > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        std::cerr << "[CUDA Preprocess] GPU image buffer is too small or has invalid step"
                   << std::endl;
         return false;
     }
 
+    prep.originalWidth = imageWidth;
+    prep.originalHeight = imageHeight;
+    prep.inputWidth = config_.inputWidth;
+    prep.inputHeight = config_.inputHeight;
+    prep.scaleX = static_cast<float>(config_.inputWidth) / static_cast<float>(imageWidth);
+    prep.scaleY = static_cast<float>(config_.inputHeight) / static_cast<float>(imageHeight);
+    prep.blob.release();
+
     launchPreprocessKernel(
-        imageDevice_,
-        image.cols,
-        image.rows,
-        static_cast<int>(packedStep),
+        imageDevice,
+        imageWidth,
+        imageHeight,
+        static_cast<int>(imageStep),
         inputDevice,
         config_.inputWidth,
         config_.inputHeight,
@@ -187,7 +126,7 @@ bool CudaPreprocessor::process(
         stream
     );
 
-    err = cudaGetLastError();
+    const cudaError_t err = cudaGetLastError();
 
     if (err != cudaSuccess) {
         std::cerr << "[CUDA Preprocess] kernel launch failed: "
@@ -195,26 +134,5 @@ bool CudaPreprocessor::process(
                   << std::endl;
         return false;
     }
-
-    imageDeviceStep_ = packedStep;
-    imageWidth_ = image.cols;
-    imageHeight_ = image.rows;
-
     return true;
-}
-
-unsigned char* CudaPreprocessor::imageDeviceBuffer() noexcept {
-    return imageDevice_;
-}
-
-size_t CudaPreprocessor::imageDeviceStep() const noexcept {
-    return imageDeviceStep_;
-}
-
-int CudaPreprocessor::imageWidth() const noexcept {
-    return imageWidth_;
-}
-
-int CudaPreprocessor::imageHeight() const noexcept {
-    return imageHeight_;
 }
