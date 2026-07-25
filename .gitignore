@@ -15,10 +15,8 @@ results/
 *.log
 
 # Local datasets and large model files
-data/
-datasets/
-build-debug/
-Dataset/
+Datasets/
+build/
 models/
 runs/
 
