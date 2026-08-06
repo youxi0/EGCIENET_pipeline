@@ -17,6 +17,7 @@ results/
 # Local datasets and large model files
 Datasets/
 build/
+build-jetson/
 models/
 runs/
 

@@ -34,7 +34,7 @@ void printUsage(const char* application) {
         << "  --warmup N          Warmup iterations, default 20\n"
         << "  --iterations N      Timed iterations, default 200\n"
         << "  --max-images N      Accuracy images, 0 means all\n"
-        << "  --threshold VALUE   Binary mask threshold, default 0.5\n"
+        << "  --threshold VALUE   Binary mask threshold, default 0.6\n"
         << "  --mean B,G,R        Raw-pixel BGR mean\n"
         << "  --std B,G,R         Raw-pixel BGR std\n"
         << "  --visualize 0|1     Include visualization and its D2H, default 1\n";

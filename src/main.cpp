@@ -132,7 +132,7 @@ void printUsage(const char* app) {
         << "  --queue_size   frame slot count, range 1-16, default 3\n"
         << "  --max_width    maximum source width, default 1920\n"
         << "  --max_height   maximum source height, default 1080\n"
-        << "  --threshold    binary mask threshold, default 0.5\n"
+        << "  --threshold    binary mask threshold, default 0.6\n"
         << "  --mean         B,G,R raw-pixel mean, default 140.505,157.845,135.66\n"
         << "  --std          B,G,R raw-pixel std, default 61.455,60.18,62.22\n"
         << "  --save_dir     save binary/probability masks; empty means disabled\n"
@@ -212,7 +212,8 @@ int main(int argc, char** argv) {
             getArg(argc, argv, "--max_width", "1920"), "--max_width");
         config.maxSourceHeight = parsePositiveDimension(
             getArg(argc, argv, "--max_height", "1080"), "--max_height");
-        config.maskThreshold = parseThreshold(getArg(argc, argv, "--threshold", "0.5"));
+        config.maskThreshold = parseThreshold(
+            getArg(argc, argv, "--threshold", "0.6"));
         config.mean = parseTriplet(
             getArg(argc, argv, "--mean", "140.505,157.845,135.66"),
             "--mean");

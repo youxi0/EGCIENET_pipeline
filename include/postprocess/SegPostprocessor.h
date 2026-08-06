@@ -7,7 +7,7 @@
 #include <cstdint>
 
 struct SegPostprocessConfig {
-    float maskThreshold = 0.5f;
+    float maskThreshold = 0.6f;
 };
 
 // 在 GPU 上把模型尺度概率图恢复到原图尺寸，并生成二值分割图。

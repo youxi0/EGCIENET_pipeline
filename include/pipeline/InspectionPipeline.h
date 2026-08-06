@@ -24,7 +24,7 @@ struct PipelineConfig {
     // BGR 顺序，数值基于原始 0-255 像素尺度。
     std::array<float, 3> mean{140.505f, 157.845f, 135.66f};
     std::array<float, 3> std{61.455f, 60.18f, 62.22f};
-    float maskThreshold = 0.5f;
+    float maskThreshold = 0.6f;
 
     // 回调在完成线程中同步执行，只能在调用期间读取 frame。
     // 不要在回调内调用 stop；如需异步持有结果，应 clone 对应 cv::Mat。

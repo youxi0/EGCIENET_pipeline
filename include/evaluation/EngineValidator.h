@@ -20,7 +20,7 @@ struct ValidationConfig {
     // BGR 顺序，数值基于原始 0-255 像素尺度。
     std::array<float, 3> mean{140.505f, 157.845f, 135.66f};
     std::array<float, 3> std{61.455f, 60.18f, 62.22f};
-    float maskThreshold = 0.5f;
+    float maskThreshold = 0.6f;
 
     // maxImages 为 0 时使用验证集中的全部图像。
     std::size_t maxImages = 0;
