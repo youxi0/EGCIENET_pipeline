@@ -8,6 +8,7 @@
 #include "postprocess/SegPostprocessor.h"
 #include "preprocess/CudaPreprocessor.h"
 #include "utils/FileLogger.h"
+#include "visualize/Visualizer.h"
 
 #include <cuda_runtime_api.h>
 
@@ -267,6 +268,7 @@ private:
               preprocessTimer(gpuStream),
               inferTimer(gpuStream),
               postprocessTimer(gpuStream),
+              visualizeTimer(gpuStream),
               d2hTimer(completionStream) {
         }
 
@@ -291,7 +293,8 @@ private:
             std::string& error
         ) {
             if (!h2dTimer.isValid() || !preprocessTimer.isValid() || !inferTimer.isValid() ||
-                !postprocessTimer.isValid() || !d2hTimer.isValid()) {
+                !postprocessTimer.isValid() || !visualizeTimer.isValid() ||
+                !d2hTimer.isValid()) {
                 error = "failed to create frame CUDA timers";
                 return false;
             }
@@ -345,6 +348,7 @@ private:
         CudaEventTimer preprocessTimer;
         CudaEventTimer inferTimer;
         CudaEventTimer postprocessTimer;
+        CudaEventTimer visualizeTimer;
         CudaEventTimer d2hTimer;
     };
 
@@ -419,6 +423,9 @@ private:
         preprocessor_ = std::make_unique<CudaPreprocessor>(preprocessConfig);
         postprocessor_ = std::make_unique<SegPostprocessor>(
             SegPostprocessConfig{config_.maskThreshold});
+        if (config_.enableVisualization) {
+            visualizer_ = std::make_unique<Visualizer>();
+        }
 
         size_t maxImageRowBytes = 0;
         size_t maxPreprocessBytes = 0;
@@ -579,6 +586,7 @@ private:
         }
 
         slots_.clear();
+        visualizer_.reset();
         postprocessor_.reset();
         preprocessor_.reset();
 
@@ -741,7 +749,7 @@ private:
         acquiredQueue_.stop();
     }
 
-    // 单个 Scheduler 线程在同一 stream 上依次提交预处理、推理和后处理。
+    // 单个 Scheduler 线程在同一 stream 上依次提交预处理、推理、后处理和可视化。
     void gpuSchedulerLoop() noexcept {
         try {
             std::size_t slotIndex = 0;
@@ -821,6 +829,26 @@ private:
                     break;
                 }
 
+                if (config_.enableVisualization) {
+                    if (!slot.visualizeTimer.start()) {
+                        fail("failed to start visualization CUDA timer");
+                        break;
+                    }
+                    const bool visualizeOk = visualizer_->process(
+                        static_cast<unsigned char*>(slot.preprocessDevice),
+                        slot.imageRowBytes,
+                        slot.frame.originalImage.cols,
+                        slot.frame.originalImage.rows,
+                        slot.probabilityDevice(),
+                        slot.binaryDevice(),
+                        gpuStream_);
+                    if (!slot.visualizeTimer.stop() || !visualizeOk) {
+                        fail("CUDA visualization failed for frame " +
+                            std::to_string(slot.frame.frameId));
+                        break;
+                    }
+                }
+
                 if (!checkCuda(
                         cudaEventRecord(slot.gpuDone, gpuStream_),
                         "cudaEventRecord gpuDone",
@@ -872,8 +900,16 @@ private:
                     slot.frame.probabilityMask,
                     slot.frame.binaryMask,
                     completionStream_);
-                if (!slot.d2hTimer.stop() || !downloadOk) {
-                    fail("mask D2H failed for frame " +
+                const bool visualizationDownloadOk = !config_.enableVisualization ||
+                    visualizer_->enqueueDownload(
+                        static_cast<const unsigned char*>(slot.preprocessDevice),
+                        slot.imageRowBytes,
+                        slot.frame.originalImage.cols,
+                        slot.frame.originalImage.rows,
+                        slot.frame.visualizedImage,
+                        completionStream_);
+                if (!slot.d2hTimer.stop() || !downloadOk || !visualizationDownloadOk) {
+                    fail("result D2H failed for frame " +
                         std::to_string(slot.frame.frameId));
                     break;
                 }
@@ -890,11 +926,15 @@ private:
                 slot.frame.cost.preprocess_ms = slot.preprocessTimer.elapsedMs();
                 slot.frame.cost.infer_ms = slot.inferTimer.elapsedMs();
                 slot.frame.cost.postprocess_ms = slot.postprocessTimer.elapsedMs();
+                slot.frame.cost.visualize_ms = config_.enableVisualization
+                    ? slot.visualizeTimer.elapsedMs()
+                    : 0.0;
                 slot.frame.cost.d2h_ms = slot.d2hTimer.elapsedMs();
                 if (slot.frame.cost.h2d_ms < 0.0 ||
                     slot.frame.cost.preprocess_ms < 0.0 ||
                     slot.frame.cost.infer_ms < 0.0 ||
                     slot.frame.cost.postprocess_ms < 0.0 ||
+                    slot.frame.cost.visualize_ms < 0.0 ||
                     slot.frame.cost.d2h_ms < 0.0) {
                     fail("failed to read CUDA timing for frame " +
                         std::to_string(slot.frame.frameId));
@@ -947,6 +987,7 @@ private:
     std::unique_ptr<TensorRTInfer> infer_;
     std::unique_ptr<CudaPreprocessor> preprocessor_;
     std::unique_ptr<SegPostprocessor> postprocessor_;
+    std::unique_ptr<Visualizer> visualizer_;
     std::vector<std::unique_ptr<FrameSlot>> slots_;
 
     // GPU Scheduler 串行提交任务，因此所有帧安全复用同一组 TensorRT 输入输出显存。

@@ -26,6 +26,9 @@ struct PipelineConfig {
     std::array<float, 3> std{61.455f, 60.18f, 62.22f};
     float maskThreshold = 0.6f;
 
+    // 仅在保存或远程显示需要时启用，避免普通推理承担叠加图和额外 D2H 开销。
+    bool enableVisualization = false;
+
     // 回调在完成线程中同步执行，只能在调用期间读取 frame。
     // 不要在回调内调用 stop；如需异步持有结果，应 clone 对应 cv::Mat。
     std::function<void(const FrameData&)> resultCallback;

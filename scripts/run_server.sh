@@ -17,6 +17,10 @@ MAX_HEIGHT="${MAX_HEIGHT:-1080}"
 THRESHOLD="${THRESHOLD:-0.6}"
 SAVE_DIR="${SAVE_DIR:-}"
 LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/results/logs}"
+TCP_HOST="${TCP_HOST:-}"
+TCP_PORT="${TCP_PORT:-9000}"
+TCP_QUEUE="${TCP_QUEUE:-2}"
+JPEG_QUALITY="${JPEG_QUALITY:-85}"
 
 if [ ! -f "${EXECUTABLE}" ]; then
     echo "[ERROR] executable not found: ${EXECUTABLE}"
@@ -44,6 +48,13 @@ echo "[INFO] queue size: ${QUEUE_SIZE}"
 echo "[INFO] max source: ${MAX_WIDTH}x${MAX_HEIGHT}"
 echo "[INFO] threshold : ${THRESHOLD}"
 echo "[INFO] log dir   : ${LOG_DIR}"
+if [ -n "${TCP_HOST}" ]; then
+    echo "[INFO] tcp target: ${TCP_HOST}:${TCP_PORT}"
+    echo "[INFO] tcp queue : ${TCP_QUEUE}"
+    echo "[INFO] jpeg      : quality ${JPEG_QUALITY}"
+else
+    echo "[INFO] tcp       : disabled"
+fi
 
 ARGS=(
     --engine "${ENGINE}"
@@ -55,6 +66,15 @@ ARGS=(
     --threshold "${THRESHOLD}"
     --log_dir "${LOG_DIR}"
 )
+
+if [ -n "${TCP_HOST}" ]; then
+    ARGS+=(
+        --tcp_host "${TCP_HOST}"
+        --tcp_port "${TCP_PORT}"
+        --tcp_queue "${TCP_QUEUE}"
+        --jpeg_quality "${JPEG_QUALITY}"
+    )
+fi
 
 if [ -n "${SAVE_DIR}" ]; then
     ARGS+=(--save_dir "${SAVE_DIR}")

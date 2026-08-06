@@ -182,6 +182,7 @@ if(EGCINET_BUILD_PIPELINE)
         src/common/Timer.cpp
         src/infer/TensorRTCommon.cpp
         src/infer/TensorRTInfer.cpp
+        src/network/TcpFrameSender.cpp
         src/pipeline/InspectionPipeline.cpp
         src/postprocess/SegPostprocessor.cpp
         src/postprocess/SegPostprocessKernel.cu

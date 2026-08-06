@@ -1,6 +1,7 @@
 #include "acquisition/ImageFolderSource.h"
 #include "acquisition/ImageSource.h"
 #include "acquisition/VideoSource.h"
+#include "network/TcpFrameSender.h"
 #include "pipeline/InspectionPipeline.h"
 #include "utils/FileLogger.h"
 
@@ -100,6 +101,22 @@ float parseThreshold(const std::string& text) {
     return value;
 }
 
+int parseIntegerRange(
+    const std::string& text,
+    const char* argumentName,
+    int minimum,
+    int maximum
+) {
+    std::size_t consumed = 0;
+    const int value = std::stoi(text, &consumed);
+    if (consumed != text.size() || value < minimum || value > maximum) {
+        std::ostringstream message;
+        message << argumentName << " must be in [" << minimum << ", " << maximum << ']';
+        throw std::invalid_argument(message.str());
+    }
+    return value;
+}
+
 std::unique_ptr<ImageSource> createSource(
     const std::string& sourceType,
     const std::string& sourcePath
@@ -136,7 +153,11 @@ void printUsage(const char* app) {
         << "  --mean         B,G,R raw-pixel mean, default 140.505,157.845,135.66\n"
         << "  --std          B,G,R raw-pixel std, default 61.455,60.18,62.22\n"
         << "  --save_dir     save binary/probability masks; empty means disabled\n"
-        << "  --log_dir      runtime log directory, default results/logs\n";
+        << "  --log_dir      runtime log directory, default results/logs\n"
+        << "  --tcp_host     upper-computer address; empty means TCP disabled\n"
+        << "  --tcp_port     upper-computer listening port, default 9000\n"
+        << "  --tcp_queue    asynchronous display queue size, range 1-8, default 2\n"
+        << "  --jpeg_quality transmitted JPEG quality, range 1-100, default 85\n";
 }
 
 std::string frameStem(std::uint64_t frameId) {
@@ -146,7 +167,11 @@ std::string frameStem(std::uint64_t frameId) {
 }
 
 // 结果回调位于完成线程，保存图像会对槽位回收和后续帧产生背压。
-void handleResult(const FrameData& frame, const std::string& saveDirectory) {
+void handleResult(
+    const FrameData& frame,
+    const std::string& saveDirectory,
+    egcinet::network::TcpFrameSender* tcpSender
+) {
     std::ostringstream timingLog;
     timingLog << std::fixed << std::setprecision(3)
               << "[Pipeline] frame=" << frame.frameId
@@ -155,9 +180,14 @@ void handleResult(const FrameData& frame, const std::string& saveDirectory) {
               << " preprocess=" << frame.cost.preprocess_ms << " ms"
               << " infer=" << frame.cost.infer_ms << " ms"
               << " postprocess=" << frame.cost.postprocess_ms << " ms"
+              << " visualize=" << frame.cost.visualize_ms << " ms"
               << " d2h=" << frame.cost.d2h_ms << " ms"
               << " total=" << frame.cost.total_ms << " ms";
     utils::FileLogger::instance().info(timingLog.str());
+
+    if (tcpSender != nullptr) {
+        tcpSender->enqueue(frame);
+    }
 
     if (saveDirectory.empty()) {
         return;
@@ -168,11 +198,14 @@ void handleResult(const FrameData& frame, const std::string& saveDirectory) {
     const std::filesystem::path binaryPath = outputDirectory / (stem + "_binary.png");
     const std::filesystem::path probabilityPath =
         outputDirectory / (stem + "_probability.png");
+    const std::filesystem::path visualizationPath =
+        outputDirectory / (stem + "_visualized.jpg");
 
     cv::Mat probabilityImage;
     frame.probabilityMask.convertTo(probabilityImage, CV_8U, 255.0);
     if (!cv::imwrite(binaryPath.string(), frame.binaryMask) ||
-        !cv::imwrite(probabilityPath.string(), probabilityImage)) {
+        !cv::imwrite(probabilityPath.string(), probabilityImage) ||
+        !cv::imwrite(visualizationPath.string(), frame.visualizedImage)) {
         throw std::runtime_error("failed to save output masks for frame "
             + std::to_string(frame.frameId));
     }
@@ -196,6 +229,13 @@ int main(int argc, char** argv) {
         const std::string saveDirectory = getArg(argc, argv, "--save_dir");
         const std::string logDirectory =
             getArg(argc, argv, "--log_dir", "results/logs");
+        const std::string tcpHost = getArg(argc, argv, "--tcp_host");
+        const int tcpPort = parseIntegerRange(
+            getArg(argc, argv, "--tcp_port", "9000"), "--tcp_port", 1, 65535);
+        const int tcpQueueSize = parseIntegerRange(
+            getArg(argc, argv, "--tcp_queue", "2"), "--tcp_queue", 1, 8);
+        const int jpegQuality = parseIntegerRange(
+            getArg(argc, argv, "--jpeg_quality", "85"), "--jpeg_quality", 1, 100);
 
         if (!saveDirectory.empty()) {
             std::filesystem::create_directories(saveDirectory);
@@ -203,6 +243,20 @@ int main(int argc, char** argv) {
         if (!utils::FileLogger::instance().open(
                 logDirectory, "egcinet_pipeline")) {
             return 1;
+        }
+
+        std::unique_ptr<egcinet::network::TcpFrameSender> tcpSender;
+        if (!tcpHost.empty()) {
+            egcinet::network::TcpSenderConfig tcpConfig;
+            tcpConfig.host = tcpHost;
+            tcpConfig.port = static_cast<std::uint16_t>(tcpPort);
+            tcpConfig.queueSize = static_cast<std::size_t>(tcpQueueSize);
+            tcpConfig.jpegQuality = jpegQuality;
+            tcpSender = std::make_unique<egcinet::network::TcpFrameSender>(
+                std::move(tcpConfig));
+            if (!tcpSender->start()) {
+                return 1;
+            }
         }
 
         egcinet::pipeline::PipelineConfig config;
@@ -220,8 +274,9 @@ int main(int argc, char** argv) {
         config.std = parseTriplet(
             getArg(argc, argv, "--std", "61.455,60.18,62.22"),
             "--std");
-        config.resultCallback = [saveDirectory](const FrameData& frame) {
-            handleResult(frame, saveDirectory);
+        config.enableVisualization = !saveDirectory.empty() || tcpSender != nullptr;
+        config.resultCallback = [saveDirectory, sender = tcpSender.get()](const FrameData& frame) {
+            handleResult(frame, saveDirectory, sender);
         };
 
         std::ostringstream startupLog;
@@ -231,7 +286,11 @@ int main(int argc, char** argv) {
                    << ", slots=" << config.queueSize
                    << ", max_source=" << config.maxSourceWidth << "x"
                    << config.maxSourceHeight
-                   << ", threshold=" << config.maskThreshold;
+                   << ", threshold=" << config.maskThreshold
+                   << ", visualization=" << (config.enableVisualization ? "on" : "off")
+                   << ", tcp=" << (tcpHost.empty()
+                       ? "off"
+                       : tcpHost + ':' + std::to_string(tcpPort));
         utils::FileLogger::instance().info(startupLog.str());
 
         auto source = createSource(sourceType, sourcePath);
@@ -251,6 +310,12 @@ int main(int argc, char** argv) {
         utils::FileLogger::instance().info(
             "[Pipeline] processed frames: " +
             std::to_string(pipeline.processedFrames()));
+        if (tcpSender != nullptr) {
+            tcpSender->stop();
+            utils::FileLogger::instance().info(
+                "[TCP] summary: sent=" + std::to_string(tcpSender->sentFrames()) +
+                ", dropped=" + std::to_string(tcpSender->droppedFrames()));
+        }
         if (!pipelineError.empty()) {
             return 1;
         }
