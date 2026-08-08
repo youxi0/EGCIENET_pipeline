@@ -8,12 +8,8 @@ void launchVisualizeKernel(
     size_t imageStep,
     int imageWidth,
     int imageHeight,
-    const float* probabilityMask,
-    const std::uint8_t* binaryMask,
-    std::uint8_t colorB,
-    std::uint8_t colorG,
-    std::uint8_t colorR,
-    float alpha,
+    const std::uint8_t* classMask,
+    VisualizerConfig config,
     cudaStream_t stream
 );
 
@@ -40,11 +36,10 @@ bool Visualizer::process(
     size_t imageStep,
     int imageWidth,
     int imageHeight,
-    const float* probabilityDevice,
-    const std::uint8_t* binaryDevice,
+    const std::uint8_t* classMaskDevice,
     cudaStream_t stream
 ) const {
-    if (imageDevice == nullptr || probabilityDevice == nullptr || binaryDevice == nullptr) {
+    if (imageDevice == nullptr || classMaskDevice == nullptr) {
         std::cerr << "[Visualizer] input device buffer is null" << std::endl;
         return false;
     }
@@ -66,12 +61,8 @@ bool Visualizer::process(
         imageStep,
         imageWidth,
         imageHeight,
-        probabilityDevice,
-        binaryDevice,
-        config_.maskColor[0],
-        config_.maskColor[1],
-        config_.maskColor[2],
-        config_.alpha,
+        classMaskDevice,
+        config_,
         stream
     );
 

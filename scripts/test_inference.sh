@@ -7,7 +7,7 @@ source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
 
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build-debug}"
 RESULT_DIR="${RESULT_DIR:-${PROJECT_ROOT}/results/debug_inference}"
-ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcinet_352_fp16.engine}"
+ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_fp16.engine}"
 IMAGE="${IMAGE:-/home/fulin/haiyanghuang/EGCIENET_pipeline/Dataset/AEBIS/Test/JPEGImages/0.jpg}"
 SANITIZER="${SANITIZER:-none}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
@@ -15,8 +15,7 @@ LAUNCH_BLOCKING="${LAUNCH_BLOCKING:-0}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
 APP="${BUILD_DIR}/bin/egcinet_infer_image"
-BINARY_MASK="${RESULT_DIR}/binary_mask.png"
-PROBABILITY_MASK="${RESULT_DIR}/probability_mask.png"
+CLASS_MASK="${RESULT_DIR}/class_mask.png"
 VISUALIZED_IMAGE="${RESULT_DIR}/visualized.png"
 RUN_LOG="${RESULT_DIR}/run.log"
 
@@ -58,8 +57,7 @@ run_sanitizer() {
         "${APP}" \
         --engine "${ENGINE}" \
         --image "${IMAGE}" \
-        --output "${BINARY_MASK}" \
-        --probability "${PROBABILITY_MASK}" \
+        --output "${CLASS_MASK}" \
         --visualized "${VISUALIZED_IMAGE}"
 }
 
@@ -114,8 +112,7 @@ echo "[INFO] result dir: ${RESULT_DIR}"
 APP_ARGS=(
     --engine "${ENGINE}"
     --image "${IMAGE}"
-    --output "${BINARY_MASK}"
-    --probability "${PROBABILITY_MASK}"
+    --output "${CLASS_MASK}"
     --visualized "${VISUALIZED_IMAGE}"
 )
 
@@ -126,8 +123,7 @@ else
     "${APP}" "${APP_ARGS[@]}" 2>&1 | tee "${RUN_LOG}"
 fi
 
-require_file "binary mask" "${BINARY_MASK}"
-require_file "probability mask" "${PROBABILITY_MASK}"
+require_file "class mask" "${CLASS_MASK}"
 require_file "visualized image" "${VISUALIZED_IMAGE}"
 
 case "${SANITIZER}" in
@@ -151,6 +147,5 @@ esac
 
 echo "[PASS] inference test finished"
 echo "[PASS] log: ${RUN_LOG}"
-echo "[PASS] binary mask: ${BINARY_MASK}"
-echo "[PASS] probability mask: ${PROBABILITY_MASK}"
+echo "[PASS] class mask: ${CLASS_MASK}"
 echo "[PASS] visualization: ${VISUALIZED_IMAGE}"

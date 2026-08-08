@@ -21,10 +21,9 @@ struct PipelineConfig {
     int maxSourceWidth = 1920;
     int maxSourceHeight = 1080;
 
-    // BGR 顺序，数值基于原始 0-255 像素尺度。
+    // BGR 顺序；对应训练配置中的归一化参数乘以 255。
     std::array<float, 3> mean{140.505f, 157.845f, 135.66f};
     std::array<float, 3> std{61.455f, 60.18f, 62.22f};
-    float maskThreshold = 0.6f;
 
     // 仅在保存或远程显示需要时启用，避免普通推理承担叠加图和额外 D2H 开销。
     bool enableVisualization = false;

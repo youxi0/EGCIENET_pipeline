@@ -76,6 +76,7 @@ public:
     size_t outputBufferBytes() const noexcept;
     nvinfer1::DataType outputDataType() const noexcept;
     size_t outputElementSize() const noexcept;
+    int outputChannels() const noexcept;
     int outputWidth() const noexcept;
     int outputHeight() const noexcept;
 

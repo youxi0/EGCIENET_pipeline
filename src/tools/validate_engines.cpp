@@ -26,15 +26,14 @@ void printUsage(const char* application) {
         << "Usage:\n"
         << "  " << application << " --images datasets/images/val"
         << " --labels datasets/labels/val"
-        << " [--fp32 models/egcinet_352_fp32.engine]"
-        << " [--fp16 models/egcinet_352_fp16.engine]"
-        << " [--int8 models/egcinet_352_int8.engine]\n"
+        << " [--fp32 models/egcienet_352_multiclass_fp32.engine]"
+        << " [--fp16 models/egcienet_352_multiclass_fp16.engine]"
+        << " [--int8 models/egcienet_352_multiclass_int8.engine]\n"
         << "Options:\n"
         << "  --output PATH       CSV output path\n"
         << "  --warmup N          Warmup iterations, default 20\n"
         << "  --iterations N      Timed iterations, default 200\n"
         << "  --max-images N      Accuracy images, 0 means all\n"
-        << "  --threshold VALUE   Binary mask threshold, default 0.6\n"
         << "  --mean B,G,R        Raw-pixel BGR mean\n"
         << "  --std B,G,R         Raw-pixel BGR std\n"
         << "  --visualize 0|1     Include visualization and its D2H, default 1\n";
@@ -117,8 +116,6 @@ bool parseArguments(
                 arguments.config.benchmarkIterations = parseSize(value, option);
             } else if (option == "--max-images") {
                 arguments.config.maxImages = parseSize(value, option);
-            } else if (option == "--threshold") {
-                arguments.config.maskThreshold = std::stof(value);
             } else if (option == "--mean") {
                 arguments.config.mean = parseChannels(value, option);
             } else if (option == "--std") {
@@ -150,9 +147,9 @@ bool parseArguments(
 void printResult(const EngineValidationResult& result) {
     std::cout << std::fixed << std::setprecision(6)
               << "[Result] " << result.name
-              << " dice=" << result.accuracy.globalDice
-              << " iou=" << result.accuracy.globalIou
-              << " mae=" << result.accuracy.mae
+              << " pixel_accuracy=" << result.accuracy.pixelAccuracy
+              << " mean_dice=" << result.accuracy.meanDice
+              << " mean_iou=" << result.accuracy.meanIou
               << " infer_mean_ms=" << result.performance.inference.meanMs
               << " e2e_mean_ms=" << result.performance.endToEnd.meanMs
               << " e2e_p95_ms=" << result.performance.endToEnd.p95Ms

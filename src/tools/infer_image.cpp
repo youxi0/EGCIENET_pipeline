@@ -43,20 +43,18 @@ public:
             return false;
         }
         const size_t pixels = width * height;
-        if (pixels > std::numeric_limits<size_t>::max() / 5) {
+        if (pixels > std::numeric_limits<size_t>::max() / 3) {
             return false;
         }
         const size_t imageBytes = pixels * 3;
-        const size_t probabilityBytes = pixels * sizeof(float);
-        const size_t binaryBytes = pixels * sizeof(std::uint8_t);
-        const size_t postprocessBytes = probabilityBytes + binaryBytes;
+        const size_t classMaskBytes = pixels * sizeof(std::uint8_t);
 
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaMalloc(&inputDevice_, infer.inputBufferBytes()) != cudaSuccess ||
             cudaMalloc(&outputDevice_, infer.outputBufferBytes()) != cudaSuccess ||
             cudaMalloc(
                 reinterpret_cast<void**>(&imageDevice_), imageBytes) != cudaSuccess ||
-            cudaMalloc(&postprocessDevice_, postprocessBytes) != cudaSuccess) {
+            cudaMalloc(&postprocessDevice_, classMaskBytes) != cudaSuccess) {
             std::cerr << "[Infer Image] failed to allocate CUDA execution resources"
                       << std::endl;
             release();
@@ -74,14 +72,9 @@ public:
         infer_ = &infer;
         imageBufferBytes_ = imageBytes;
 
-        float* probabilityDevice = static_cast<float*>(postprocessDevice_);
-        auto* binaryDevice = static_cast<std::uint8_t*>(postprocessDevice_) +
-                             probabilityBytes;
-        if (!postprocessor.attachOutputBuffers(
-                probabilityDevice,
-                probabilityBytes,
-                binaryDevice,
-                binaryBytes)) {
+        if (!postprocessor.attachOutputBuffer(
+                static_cast<std::uint8_t*>(postprocessDevice_),
+                classMaskBytes)) {
             release();
             return false;
         }
@@ -150,7 +143,7 @@ private:
             infer_ = nullptr;
         }
         if (postprocessor_ != nullptr) {
-            postprocessor_->detachOutputBuffers();
+            postprocessor_->detachOutputBuffer();
             postprocessor_ = nullptr;
         }
         if (postprocessDevice_ != nullptr) {
@@ -206,10 +199,9 @@ std::string getArgument(
 void printUsage(const char* application) {
     std::cout << "Usage:\n"
               << "  " << application
-              << " --engine models/egcinet_fp16.engine"
+              << " --engine models/egcienet_352_multiclass_fp16.engine"
               << " --image data/test.jpg"
-              << " [--output mask.png]"
-              << " [--probability probability.png]"
+              << " [--output class_mask.png]"
               << " [--visualized visualized.png]\n";
 }
 
@@ -218,9 +210,8 @@ void printUsage(const char* application) {
 int main(int argc, char** argv) {
     const std::string enginePath = getArgument(argc, argv, "--engine");
     const std::string imagePath = getArgument(argc, argv, "--image");
-    const std::string outputPath = getArgument(argc, argv, "--output", "mask.png");
-    const std::string probabilityPath =
-        getArgument(argc, argv, "--probability", "probability.png");
+    const std::string outputPath =
+        getArgument(argc, argv, "--output", "class_mask.png");
     const std::string visualizedPath =
         getArgument(argc, argv, "--visualized", "visualized.png");
 
@@ -317,6 +308,7 @@ int main(int argc, char** argv) {
         infer.outputDeviceBuffer(),
         infer.outputBufferBytes(),
         infer.outputElementSize(),
+        infer.outputChannels(),
         infer.outputWidth(),
         infer.outputHeight(),
         image.cols,
@@ -337,8 +329,7 @@ int main(int argc, char** argv) {
         imageStep,
         image.cols,
         image.rows,
-        postprocessor.probabilityDeviceBuffer(),
-        postprocessor.binaryDeviceBuffer(),
+        postprocessor.classMaskDeviceBuffer(),
         infer.stream()
     );
     const bool visualizeTimerStopped = visualizeTimer.stop();
@@ -351,14 +342,9 @@ int main(int argc, char** argv) {
         return 8;
     }
 
-    cv::Mat probabilityMask;
-    cv::Mat binaryMask;
+    cv::Mat classMask;
     cv::Mat visualizedImage;
-    const bool masksDownloadOk = postprocessor.enqueueDownload(
-        probabilityMask,
-        binaryMask,
-        infer.stream()
-    );
+    const bool masksDownloadOk = postprocessor.enqueueDownload(classMask, infer.stream());
     const bool imageDownloadOk = visualizer.enqueueDownload(
         executionResources.imageDeviceBuffer(),
         imageStep,
@@ -393,20 +379,18 @@ int main(int argc, char** argv) {
 
     double minimum = 0.0;
     double maximum = 0.0;
-    cv::minMaxLoc(probabilityMask, &minimum, &maximum);
+    cv::minMaxLoc(classMask, &minimum, &maximum);
 
-    cv::Mat probabilityImage;
-    probabilityMask.convertTo(probabilityImage, CV_8U, 255.0);
-    if (!cv::imwrite(outputPath, binaryMask) ||
-        !cv::imwrite(probabilityPath, probabilityImage) ||
+    // 原样保存 0~4 类别 ID，输出可直接作为灰度标签重新读取。
+    if (!cv::imwrite(outputPath, classMask) ||
         !cv::imwrite(visualizedPath, visualizedImage)) {
         std::cerr << "[Infer Image] failed to write mask: " << outputPath << std::endl;
         return 10;
     }
 
-    std::cout << "[Infer Image] mask shape: "
-              << probabilityMask.cols << 'x' << probabilityMask.rows << std::endl;
-    std::cout << "[Infer Image] probability range: ["
+    std::cout << "[Infer Image] class mask shape: "
+              << classMask.cols << 'x' << classMask.rows << std::endl;
+    std::cout << "[Infer Image] class id range: ["
               << minimum << ", " << maximum << "]" << std::endl;
     std::cout << "[Infer Image] h2d_gpu_ms: " << h2dGpuMs << std::endl;
     std::cout << "[Infer Image] preprocess_gpu_ms: "
@@ -418,8 +402,7 @@ int main(int argc, char** argv) {
     std::cout << "[Infer Image] visualize_gpu_ms: "
               << visualizeGpuMs << std::endl;
     std::cout << "[Infer Image] d2h_ms: " << d2hMs << std::endl;
-    std::cout << "[Infer Image] saved binary mask: " << outputPath << std::endl;
-    std::cout << "[Infer Image] saved probability mask: " << probabilityPath << std::endl;
+    std::cout << "[Infer Image] saved class mask: " << outputPath << std::endl;
     std::cout << "[Infer Image] saved visualization: " << visualizedPath << std::endl;
     return 0;
 }

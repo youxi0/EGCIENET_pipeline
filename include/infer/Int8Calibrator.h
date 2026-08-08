@@ -11,7 +11,7 @@
 
 struct Int8CalibratorConfig {
     std::string imageDirectory;
-    std::string cacheFile = "models/egcinet_352_int8.cache";
+    std::string cacheFile = "models/egcienet_352_multiclass_int8.cache";
     std::string inputTensorName = "image";
 
     int batchSize = 1;

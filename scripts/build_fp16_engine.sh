@@ -5,8 +5,8 @@ set -Eeuo pipefail
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
 
-ONNX="${ONNX:-${PROJECT_ROOT}/models/egcinet_352.onnx}"
-ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcinet_352_fp16.engine}"
+ONNX="${ONNX:-${PROJECT_ROOT}/models/egcienet_352_multiclass.onnx}"
+ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_fp16.engine}"
 WORKSPACE_MIB="${WORKSPACE_MIB:-2048}"
 LAYER_PRECISIONS="${LAYER_PRECISIONS:-}"
 LAYER_OUTPUT_TYPES="${LAYER_OUTPUT_TYPES:-}"

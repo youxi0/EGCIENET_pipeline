@@ -6,14 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 
-struct SegPostprocessConfig {
-    float maskThreshold = 0.6f;
-};
-
-// 在 GPU 上把模型尺度概率图恢复到原图尺寸，并生成二值分割图。
+// 在 GPU 上对 [1,5,H,W] 输出逐像素执行 argmax，并恢复到原图尺寸。
+// 恢复尺寸时先双线性采样每个类别分数，再比较类别，不能插值类别 ID。
 class SegPostprocessor {
 public:
-    explicit SegPostprocessor(SegPostprocessConfig config = {});
+    SegPostprocessor() = default;
     ~SegPostprocessor() = default;
 
     SegPostprocessor(const SegPostprocessor&) = delete;
@@ -21,20 +18,19 @@ public:
     SegPostprocessor(SegPostprocessor&&) = delete;
     SegPostprocessor& operator=(SegPostprocessor&&) = delete;
 
-    // 挂接调用方拥有的概率图和二值图显存；本类不申请或释放这些资源。
-    bool attachOutputBuffers(
-        float* probabilityDevice,
-        size_t probabilityBufferBytes,
-        std::uint8_t* binaryDevice,
-        size_t binaryBufferBytes
+    // 挂接调用方拥有的类别图显存；本类不申请或释放该资源。
+    bool attachOutputBuffer(
+        std::uint8_t* classMaskDevice,
+        size_t classMaskBufferBytes
     ) noexcept;
-    void detachOutputBuffers() noexcept;
+    void detachOutputBuffer() noexcept;
 
     // 输入为 TensorRT output tensor；输出仍保留在 GPU，不执行 D2H。
     bool process(
         const void* modelMaskDevice,
         size_t modelBufferBytes,
         size_t modelElementSize,
+        int modelChannels,
         int modelWidth,
         int modelHeight,
         int outputWidth,
@@ -47,49 +43,40 @@ public:
         const void* modelMaskDevice,
         size_t modelBufferBytes,
         size_t modelElementSize,
+        int modelChannels,
         int modelWidth,
         int modelHeight,
-        float* probabilityDevice,
-        size_t probabilityBufferBytes,
-        std::uint8_t* binaryDevice,
-        size_t binaryBufferBytes,
+        std::uint8_t* classMaskDevice,
+        size_t classMaskBufferBytes,
         int outputWidth,
         int outputHeight,
         cudaStream_t stream
     ) const;
 
-    // 在同一 stream 上排队下载概率图和二值图；该函数不主动同步。
+    // 在同一 stream 上排队下载类别图；该函数不主动同步。
     bool enqueueDownload(
-        cv::Mat& probabilityMask,
-        cv::Mat& binaryMask,
+        cv::Mat& classMask,
         cudaStream_t stream
     ) const;
 
     // Pipeline 路径：从指定槽位显存下载结果，不依赖内部输出缓冲区。
     bool enqueueDownloadFromBuffers(
-        const float* probabilityDevice,
-        size_t probabilityBufferBytes,
-        const std::uint8_t* binaryDevice,
-        size_t binaryBufferBytes,
+        const std::uint8_t* classMaskDevice,
+        size_t classMaskBufferBytes,
         int outputWidth,
         int outputHeight,
-        cv::Mat& probabilityMask,
-        cv::Mat& binaryMask,
+        cv::Mat& classMask,
         cudaStream_t stream
     ) const;
 
-    const float* probabilityDeviceBuffer() const noexcept;
-    const std::uint8_t* binaryDeviceBuffer() const noexcept;
+    const std::uint8_t* classMaskDeviceBuffer() const noexcept;
     int outputWidth() const noexcept;
     int outputHeight() const noexcept;
 
 private:
-    SegPostprocessConfig config_;
     // 非拥有指针，仅供单图和验证工具的兼容路径使用。
-    float* probabilityDevice_ = nullptr;
-    std::uint8_t* binaryDevice_ = nullptr;
-    size_t probabilityBufferBytes_ = 0;
-    size_t binaryBufferBytes_ = 0;
+    std::uint8_t* classMaskDevice_ = nullptr;
+    size_t classMaskBufferBytes_ = 0;
     int outputWidth_ = 0;
     int outputHeight_ = 0;
 };

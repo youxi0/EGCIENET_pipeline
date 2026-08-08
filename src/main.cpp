@@ -92,15 +92,6 @@ int parsePositiveDimension(const std::string& text, const char* argumentName) {
     return value;
 }
 
-float parseThreshold(const std::string& text) {
-    std::size_t consumed = 0;
-    const float value = std::stof(text, &consumed);
-    if (consumed != text.size() || value < 0.0f || value > 1.0f) {
-        throw std::invalid_argument("--threshold must be in [0, 1]");
-    }
-    return value;
-}
-
 int parseIntegerRange(
     const std::string& text,
     const char* argumentName,
@@ -142,17 +133,16 @@ void printUsage(const char* app) {
     std::cout
         << "Usage:\n"
         << "  " << app
-        << " --engine models/egcinet_352_fp16.engine"
+        << " --engine models/egcienet_352_multiclass_fp16.engine"
         << " --source datasets/images/val --type folder [options]\n\n"
         << "Options:\n"
         << "  --type         folder | video | camera, default folder\n"
         << "  --queue_size   frame slot count, range 1-16, default 3\n"
         << "  --max_width    maximum source width, default 1920\n"
         << "  --max_height   maximum source height, default 1080\n"
-        << "  --threshold    binary mask threshold, default 0.6\n"
         << "  --mean         B,G,R raw-pixel mean, default 140.505,157.845,135.66\n"
         << "  --std          B,G,R raw-pixel std, default 61.455,60.18,62.22\n"
-        << "  --save_dir     save binary/probability masks; empty means disabled\n"
+        << "  --save_dir     save class mask and visualization; empty means disabled\n"
         << "  --log_dir      runtime log directory, default results/logs\n"
         << "  --tcp_host     upper-computer address; empty means TCP disabled\n"
         << "  --tcp_port     upper-computer listening port, default 9000\n"
@@ -195,16 +185,13 @@ void handleResult(
 
     const std::filesystem::path outputDirectory(saveDirectory);
     const std::string stem = frameStem(frame.frameId);
-    const std::filesystem::path binaryPath = outputDirectory / (stem + "_binary.png");
-    const std::filesystem::path probabilityPath =
-        outputDirectory / (stem + "_probability.png");
+    const std::filesystem::path classMaskPath =
+        outputDirectory / (stem + "_classes.png");
     const std::filesystem::path visualizationPath =
         outputDirectory / (stem + "_visualized.jpg");
 
-    cv::Mat probabilityImage;
-    frame.probabilityMask.convertTo(probabilityImage, CV_8U, 255.0);
-    if (!cv::imwrite(binaryPath.string(), frame.binaryMask) ||
-        !cv::imwrite(probabilityPath.string(), probabilityImage) ||
+    // 类别图必须原样保存 0~4，不能乘 255，否则会破坏训练标签 ID。
+    if (!cv::imwrite(classMaskPath.string(), frame.classMask) ||
         !cv::imwrite(visualizationPath.string(), frame.visualizedImage)) {
         throw std::runtime_error("failed to save output masks for frame "
             + std::to_string(frame.frameId));
@@ -266,8 +253,6 @@ int main(int argc, char** argv) {
             getArg(argc, argv, "--max_width", "1920"), "--max_width");
         config.maxSourceHeight = parsePositiveDimension(
             getArg(argc, argv, "--max_height", "1080"), "--max_height");
-        config.maskThreshold = parseThreshold(
-            getArg(argc, argv, "--threshold", "0.6"));
         config.mean = parseTriplet(
             getArg(argc, argv, "--mean", "140.505,157.845,135.66"),
             "--mean");
@@ -286,7 +271,6 @@ int main(int argc, char** argv) {
                    << ", slots=" << config.queueSize
                    << ", max_source=" << config.maxSourceWidth << "x"
                    << config.maxSourceHeight
-                   << ", threshold=" << config.maskThreshold
                    << ", visualization=" << (config.enableVisualization ? "on" : "off")
                    << ", tcp=" << (tcpHost.empty()
                        ? "off"

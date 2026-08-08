@@ -14,9 +14,9 @@ set -Eeuo pipefail
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BASE_BUILDER="${PROJECT_ROOT}/scripts/build_int8_engine.sh"
 
-ONNX="${ONNX:-${PROJECT_ROOT}/models/egcienet_352.onnx}"
-ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_hybrid_v1.engine}"
-CALIB_CACHE="${CALIB_CACHE:-${PROJECT_ROOT}/models/egcienet_352_int8.cache}"
+ONNX="${ONNX:-${PROJECT_ROOT}/models/egcienet_352_multiclass.onnx}"
+ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_hybrid_v1.engine}"
+CALIB_CACHE="${CALIB_CACHE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_int8.cache}"
 WORKSPACE_MIB="${WORKSPACE_MIB:-2048}"
 VALIDATE_LAYER_NAMES="${VALIDATE_LAYER_NAMES:-1}"
 PRINT_ONLY="${PRINT_ONLY:-0}"

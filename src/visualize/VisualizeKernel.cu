@@ -1,3 +1,5 @@
+#include "visualize/Visualizer.h"
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -11,12 +13,8 @@ __global__ void visualizeKernel(
     size_t imageStep,
     int imageWidth,
     int imageHeight,
-    const float* probabilityMask,
-    const std::uint8_t* binaryMask,
-    std::uint8_t colorB,
-    std::uint8_t colorG,
-    std::uint8_t colorR,
-    float alpha
+    const std::uint8_t* classMask,
+    VisualizerConfig config
 ) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -24,23 +22,22 @@ __global__ void visualizeKernel(
         return;
     }
 
-    const int maskIndex = y * imageWidth + x;
-    if (binaryMask[maskIndex] == 0) {
+    const std::uint8_t classId = classMask[
+        static_cast<size_t>(y) * static_cast<size_t>(imageWidth) +
+        static_cast<size_t>(x)];
+    if (classId == 0 || classId >= egcinet::segmentation::kClassCount) {
         return;
     }
 
-    // mask 内至少使用一半透明度，概率越高覆盖越明显，保证区域清晰可见。
-    const float probability = fminf(fmaxf(probabilityMask[maskIndex], 0.0f), 1.0f);
-    const float blend = alpha * (0.5f + 0.5f * probability);
-    const float keep = 1.0f - blend;
+    const BgrColor color = config.classColors[classId];
+    const float keep = 1.0f - config.alpha;
     unsigned char* pixel = image + static_cast<size_t>(y) * imageStep + x * 3;
-
     pixel[0] = static_cast<unsigned char>(
-        fminf(fmaxf(pixel[0] * keep + colorB * blend, 0.0f), 255.0f));
+        fminf(fmaxf(pixel[0] * keep + color.b * config.alpha, 0.0f), 255.0f));
     pixel[1] = static_cast<unsigned char>(
-        fminf(fmaxf(pixel[1] * keep + colorG * blend, 0.0f), 255.0f));
+        fminf(fmaxf(pixel[1] * keep + color.g * config.alpha, 0.0f), 255.0f));
     pixel[2] = static_cast<unsigned char>(
-        fminf(fmaxf(pixel[2] * keep + colorR * blend, 0.0f), 255.0f));
+        fminf(fmaxf(pixel[2] * keep + color.r * config.alpha, 0.0f), 255.0f));
 }
 
 } // namespace
@@ -50,12 +47,8 @@ void launchVisualizeKernel(
     size_t imageStep,
     int imageWidth,
     int imageHeight,
-    const float* probabilityMask,
-    const std::uint8_t* binaryMask,
-    std::uint8_t colorB,
-    std::uint8_t colorG,
-    std::uint8_t colorR,
-    float alpha,
+    const std::uint8_t* classMask,
+    VisualizerConfig config,
     cudaStream_t stream
 ) {
     const dim3 block(16, 16);
@@ -69,11 +62,7 @@ void launchVisualizeKernel(
         imageStep,
         imageWidth,
         imageHeight,
-        probabilityMask,
-        binaryMask,
-        colorB,
-        colorG,
-        colorR,
-        alpha
+        classMask,
+        config
     );
 }

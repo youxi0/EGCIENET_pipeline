@@ -5,8 +5,8 @@ set -Eeuo pipefail
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
 
-ONNX="${ONNX:-${PROJECT_ROOT}/models/egcinet_352.onnx}"
-ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcinet_352_fp32.engine}"
+ONNX="${ONNX:-${PROJECT_ROOT}/models/egcienet_352_multiclass.onnx}"
+ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_fp32.engine}"
 WORKSPACE_MIB="${WORKSPACE_MIB:-2048}"
 
 # FP32 engine 只作为同一 TensorRT 后端下的精度基线，不启用 FP16 或 INT8。

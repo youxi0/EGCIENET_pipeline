@@ -30,9 +30,8 @@ struct FrameData {
     // CPU/CUDA 预处理和后处理共享的 resize/归一化元信息。
     PreprocessResult prep;
 
-    // GPU 后处理完成后统一下载的原图尺寸结果。
-    cv::Mat probabilityMask;
-    cv::Mat binaryMask;
+    // GPU 后处理完成后下载的原图尺寸类别图，CV_8UC1，每个像素取值为 0~4。
+    cv::Mat classMask;
     cv::Mat visualizedImage;
 
     FrameCost cost;

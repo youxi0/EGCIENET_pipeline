@@ -125,16 +125,12 @@ bool enqueueBgrImageUpload(
     return true;
 }
 
-// 概率图和二值图连续存放在槽位独立的后处理显存中，统一检查大小计算是否溢出。
-bool maskBufferBytes(
+// 每个像素只保存一个 0~4 类别 ID，槽位后处理显存按最大原图尺寸预分配。
+bool classMaskBufferBytes(
     int width,
     int height,
-    size_t& probabilityBytes,
-    size_t& binaryBytes,
     size_t& totalBytes
 ) noexcept {
-    probabilityBytes = 0;
-    binaryBytes = 0;
     totalBytes = 0;
     if (width <= 0 || height <= 0) {
         return false;
@@ -146,16 +142,7 @@ bool maskBufferBytes(
         return false;
     }
 
-    const size_t pixels = widthValue * heightValue;
-    if (pixels > std::numeric_limits<size_t>::max() / sizeof(float)) {
-        return false;
-    }
-    probabilityBytes = pixels * sizeof(float);
-    binaryBytes = pixels * sizeof(std::uint8_t);
-    if (probabilityBytes > std::numeric_limits<size_t>::max() - binaryBytes) {
-        return false;
-    }
-    totalBytes = probabilityBytes + binaryBytes;
+    totalBytes = widthValue * heightValue * sizeof(std::uint8_t);
     return true;
 }
 
@@ -324,12 +311,8 @@ private:
             return true;
         }
 
-        float* probabilityDevice() noexcept {
-            return static_cast<float*>(postprocessDevice);
-        }
-
-        std::uint8_t* binaryDevice() noexcept {
-            return static_cast<std::uint8_t*>(postprocessDevice) + probabilityBytes;
+        std::uint8_t* classMaskDevice() noexcept {
+            return static_cast<std::uint8_t*>(postprocessDevice);
         }
 
         FrameData frame;
@@ -338,8 +321,7 @@ private:
         void* postprocessDevice = nullptr;
         size_t preprocessBytes = 0;
         size_t postprocessBytes = 0;
-        size_t probabilityBytes = 0;
-        size_t binaryBytes = 0;
+        size_t classMaskBytes = 0;
         size_t imageRowBytes = 0;
         size_t imageBytes = 0;
         cudaEvent_t h2dDone = nullptr;
@@ -375,10 +357,6 @@ private:
         }
         if (config_.maxSourceWidth <= 0 || config_.maxSourceHeight <= 0) {
             setError("maximum source width and height must be positive");
-            return false;
-        }
-        if (config_.maskThreshold < 0.0f || config_.maskThreshold > 1.0f) {
-            setError("mask threshold must be in [0, 1]");
             return false;
         }
         for (float value : config_.std) {
@@ -421,16 +399,13 @@ private:
         preprocessConfig.mean = config_.mean;
         preprocessConfig.std = config_.std;
         preprocessor_ = std::make_unique<CudaPreprocessor>(preprocessConfig);
-        postprocessor_ = std::make_unique<SegPostprocessor>(
-            SegPostprocessConfig{config_.maskThreshold});
+        postprocessor_ = std::make_unique<SegPostprocessor>();
         if (config_.enableVisualization) {
             visualizer_ = std::make_unique<Visualizer>();
         }
 
         size_t maxImageRowBytes = 0;
         size_t maxPreprocessBytes = 0;
-        size_t maxProbabilityBytes = 0;
-        size_t maxBinaryBytes = 0;
         size_t maxPostprocessBytes = 0;
         if (!bgrBufferBytes(
                 config_.maxSourceWidth,
@@ -438,11 +413,9 @@ private:
                 maxImageRowBytes,
                 maxPreprocessBytes,
                 cudaError) ||
-            !maskBufferBytes(
+            !classMaskBufferBytes(
                 config_.maxSourceWidth,
                 config_.maxSourceHeight,
-                maxProbabilityBytes,
-                maxBinaryBytes,
                 maxPostprocessBytes)) {
             setError(cudaError.empty()
                 ? "maximum source dimensions overflow buffer size"
@@ -632,17 +605,13 @@ private:
 
         size_t imageRowBytes = 0;
         size_t imageBytes = 0;
-        size_t probabilityBytes = 0;
-        size_t binaryBytes = 0;
         size_t postprocessBytes = 0;
         if (!getBgrImageLayout(
                 slot.frame.originalImage, imageRowBytes, imageBytes, error) ||
             imageRowBytes == 0 ||
-            !maskBufferBytes(
+            !classMaskBufferBytes(
                 slot.frame.originalImage.cols,
                 slot.frame.originalImage.rows,
-                probabilityBytes,
-                binaryBytes,
                 postprocessBytes)) {
             if (error.empty()) {
                 error = "invalid frame type or dimensions";
@@ -656,8 +625,7 @@ private:
             return false;
         }
 
-        slot.probabilityBytes = probabilityBytes;
-        slot.binaryBytes = binaryBytes;
+        slot.classMaskBytes = postprocessBytes;
         slot.imageRowBytes = imageRowBytes;
         slot.imageBytes = imageBytes;
         return true;
@@ -814,12 +782,11 @@ private:
                     outputDevice_,
                     outputBytes_,
                     infer_->outputElementSize(),
+                    infer_->outputChannels(),
                     infer_->outputWidth(),
                     infer_->outputHeight(),
-                    slot.probabilityDevice(),
-                    slot.probabilityBytes,
-                    slot.binaryDevice(),
-                    slot.binaryBytes,
+                    slot.classMaskDevice(),
+                    slot.classMaskBytes,
                     slot.frame.originalImage.cols,
                     slot.frame.originalImage.rows,
                     gpuStream_);
@@ -839,8 +806,7 @@ private:
                         slot.imageRowBytes,
                         slot.frame.originalImage.cols,
                         slot.frame.originalImage.rows,
-                        slot.probabilityDevice(),
-                        slot.binaryDevice(),
+                        slot.classMaskDevice(),
                         gpuStream_);
                     if (!slot.visualizeTimer.stop() || !visualizeOk) {
                         fail("CUDA visualization failed for frame " +
@@ -891,14 +857,11 @@ private:
                     break;
                 }
                 const bool downloadOk = postprocessor_->enqueueDownloadFromBuffers(
-                    slot.probabilityDevice(),
-                    slot.probabilityBytes,
-                    slot.binaryDevice(),
-                    slot.binaryBytes,
+                    slot.classMaskDevice(),
+                    slot.classMaskBytes,
                     slot.frame.originalImage.cols,
                     slot.frame.originalImage.rows,
-                    slot.frame.probabilityMask,
-                    slot.frame.binaryMask,
+                    slot.frame.classMask,
                     completionStream_);
                 const bool visualizationDownloadOk = !config_.enableVisualization ||
                     visualizer_->enqueueDownload(
@@ -958,8 +921,7 @@ private:
                 processedFrames_.fetch_add(1, std::memory_order_release);
                 slot.frame.releaseTransient();
                 slot.frame = FrameData{};
-                slot.probabilityBytes = 0;
-                slot.binaryBytes = 0;
+                slot.classMaskBytes = 0;
                 slot.imageRowBytes = 0;
                 slot.imageBytes = 0;
                 if (!freeSlots_.push(slotIndex)) {

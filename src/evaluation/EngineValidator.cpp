@@ -36,14 +36,11 @@ struct DatasetSample {
 };
 
 struct AccuracyAccumulator {
-    std::uint64_t truePositive = 0;
-    std::uint64_t falsePositive = 0;
-    std::uint64_t falseNegative = 0;
+    // 行是真值类别，列是预测类别。
+    std::array<
+        std::array<std::uint64_t, egcinet::segmentation::kClassCount>,
+        egcinet::segmentation::kClassCount> confusion{};
     std::uint64_t pixelCount = 0;
-    double absoluteError = 0.0;
-    double squaredError = 0.0;
-    double diceSum = 0.0;
-    double iouSum = 0.0;
 };
 
 struct TimingSamples {
@@ -74,14 +71,11 @@ public:
         size_t maximumPixels,
         std::string& error
     ) {
-        if (imageBufferBytes == 0 || maximumPixels == 0 ||
-            maximumPixels > std::numeric_limits<size_t>::max() / 5) {
+        if (imageBufferBytes == 0 || maximumPixels == 0) {
             error = "invalid validation image buffer capacity";
             return false;
         }
-        const size_t probabilityBytes = maximumPixels * sizeof(float);
-        const size_t binaryBytes = maximumPixels * sizeof(std::uint8_t);
-        const size_t postprocessBytes = probabilityBytes + binaryBytes;
+        const size_t classMaskBytes = maximumPixels * sizeof(std::uint8_t);
 
         cudaError_t status = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
         if (status == cudaSuccess) {
@@ -95,7 +89,7 @@ public:
                 reinterpret_cast<void**>(&imageDevice_), imageBufferBytes);
         }
         if (status == cudaSuccess) {
-            status = cudaMalloc(&postprocessDevice_, postprocessBytes);
+            status = cudaMalloc(&postprocessDevice_, classMaskBytes);
         }
         if (status != cudaSuccess) {
             error = std::string("failed to initialize validation CUDA resources: ") +
@@ -116,14 +110,9 @@ public:
         infer_ = &infer;
         imageBufferBytes_ = imageBufferBytes;
 
-        float* probabilityDevice = static_cast<float*>(postprocessDevice_);
-        auto* binaryDevice = static_cast<std::uint8_t*>(postprocessDevice_) +
-                             probabilityBytes;
-        if (!postprocessor.attachOutputBuffers(
-                probabilityDevice,
-                probabilityBytes,
-                binaryDevice,
-                binaryBytes)) {
+        if (!postprocessor.attachOutputBuffer(
+                static_cast<std::uint8_t*>(postprocessDevice_),
+                classMaskBytes)) {
             error = "failed to attach validation postprocessing buffer";
             release();
             return false;
@@ -193,7 +182,7 @@ private:
             infer_ = nullptr;
         }
         if (postprocessor_ != nullptr) {
-            postprocessor_->detachOutputBuffers();
+            postprocessor_->detachOutputBuffer();
             postprocessor_ = nullptr;
         }
         if (postprocessDevice_ != nullptr) {
@@ -353,7 +342,7 @@ bool inspectDatasetCapacity(
     return maximumImageBytes > 0 && maximumPixels > 0;
 }
 
-// 读取一个 BGR 图像及其灰度二值标签，并检查原始尺寸一致性。
+// 读取一个 BGR 图像及其 0~4 灰度类别标签，并检查原始尺寸一致性。
 bool readSample(
     const DatasetSample& sample,
     cv::Mat& image,
@@ -378,6 +367,12 @@ bool readSample(
                << ", " << sample.labelPath.string() << " is "
                << label.cols << 'x' << label.rows;
         error = stream.str();
+        return false;
+    }
+    double labelMaximum = 0.0;
+    cv::minMaxLoc(label, nullptr, &labelMaximum);
+    if (labelMaximum >= egcinet::segmentation::kClassCount) {
+        error = "label contains class id outside [0, 4]: " + sample.labelPath.string();
         return false;
     }
     return true;
@@ -420,6 +415,7 @@ bool enqueueInference(
             infer.outputDeviceBuffer(),
             infer.outputBufferBytes(),
             infer.outputElementSize(),
+            infer.outputChannels(),
             infer.outputWidth(),
             infer.outputHeight(),
             image.cols,
@@ -441,58 +437,20 @@ bool synchronize(cudaStream_t stream, std::string& error) {
     return false;
 }
 
-// 累加一个样本的混淆矩阵、逐图指标和概率误差。
+// 累加多类别混淆矩阵；类别图和标签都直接使用训练定义的 0~4 ID。
 void accumulateAccuracy(
-    const cv::Mat& probabilityMask,
-    const cv::Mat& binaryMask,
+    const cv::Mat& classMask,
     const cv::Mat& label,
     AccuracyAccumulator& accumulator
 ) {
-    double labelMaximum = 0.0;
-    cv::minMaxLoc(label, nullptr, &labelMaximum);
-    const double labelThreshold = labelMaximum <= 1.0 ? 0.5 : labelMaximum * 0.5;
-
-    std::uint64_t imageTruePositive = 0;
-    std::uint64_t imageFalsePositive = 0;
-    std::uint64_t imageFalseNegative = 0;
-
     for (int row = 0; row < label.rows; ++row) {
-        const float* probability = probabilityMask.ptr<float>(row);
-        const std::uint8_t* prediction = binaryMask.ptr<std::uint8_t>(row);
+        const std::uint8_t* prediction = classMask.ptr<std::uint8_t>(row);
         const std::uint8_t* groundTruth = label.ptr<std::uint8_t>(row);
         for (int column = 0; column < label.cols; ++column) {
-            const bool predictedPositive = prediction[column] != 0;
-            const bool groundTruthPositive = groundTruth[column] > labelThreshold;
-            if (predictedPositive && groundTruthPositive) {
-                ++imageTruePositive;
-            } else if (predictedPositive) {
-                ++imageFalsePositive;
-            } else if (groundTruthPositive) {
-                ++imageFalseNegative;
-            }
-
-            const double target = groundTruthPositive ? 1.0 : 0.0;
-            const double difference = static_cast<double>(probability[column]) - target;
-            accumulator.absoluteError += std::abs(difference);
-            accumulator.squaredError += difference * difference;
+            accumulator.confusion[groundTruth[column]][prediction[column]]++;
         }
     }
-
-    accumulator.truePositive += imageTruePositive;
-    accumulator.falsePositive += imageFalsePositive;
-    accumulator.falseNegative += imageFalseNegative;
     accumulator.pixelCount += static_cast<std::uint64_t>(label.total());
-
-    const double diceDenominator = static_cast<double>(
-        2 * imageTruePositive + imageFalsePositive + imageFalseNegative);
-    const double iouDenominator = static_cast<double>(
-        imageTruePositive + imageFalsePositive + imageFalseNegative);
-    accumulator.diceSum += diceDenominator == 0.0
-        ? 1.0
-        : 2.0 * static_cast<double>(imageTruePositive) / diceDenominator;
-    accumulator.iouSum += iouDenominator == 0.0
-        ? 1.0
-        : static_cast<double>(imageTruePositive) / iouDenominator;
 }
 
 // 将整个验证集的累计值转换成最终精度指标。
@@ -504,31 +462,58 @@ AccuracySummary finishAccuracy(
     summary.imageCount = imageCount;
     summary.pixelCount = accumulator.pixelCount;
 
-    const double truePositive = static_cast<double>(accumulator.truePositive);
-    const double falsePositive = static_cast<double>(accumulator.falsePositive);
-    const double falseNegative = static_cast<double>(accumulator.falseNegative);
-    const double diceDenominator = 2.0 * truePositive + falsePositive + falseNegative;
-    const double iouDenominator = truePositive + falsePositive + falseNegative;
-    const double precisionDenominator = truePositive + falsePositive;
-    const double recallDenominator = truePositive + falseNegative;
+    std::uint64_t correctPixels = 0;
+    std::size_t activeClasses = 0;
+    for (int classId = 0; classId < egcinet::segmentation::kClassCount; ++classId) {
+        std::uint64_t truthPixels = 0;
+        std::uint64_t predictedPixels = 0;
+        for (int other = 0; other < egcinet::segmentation::kClassCount; ++other) {
+            truthPixels += accumulator.confusion[classId][other];
+            predictedPixels += accumulator.confusion[other][classId];
+        }
 
-    summary.globalDice = diceDenominator == 0.0
-        ? 1.0 : 2.0 * truePositive / diceDenominator;
-    summary.globalIou = iouDenominator == 0.0
-        ? 1.0 : truePositive / iouDenominator;
-    summary.precision = precisionDenominator == 0.0
-        ? 1.0 : truePositive / precisionDenominator;
-    summary.recall = recallDenominator == 0.0
-        ? 1.0 : truePositive / recallDenominator;
-    summary.meanDice = accumulator.diceSum / static_cast<double>(imageCount);
-    summary.meanIou = accumulator.iouSum / static_cast<double>(imageCount);
-    summary.mae = accumulator.absoluteError / static_cast<double>(accumulator.pixelCount);
-    summary.rmse = std::sqrt(
-        accumulator.squaredError / static_cast<double>(accumulator.pixelCount));
+        const std::uint64_t truePositive = accumulator.confusion[classId][classId];
+        correctPixels += truePositive;
+        const std::uint64_t falsePositive = predictedPixels - truePositive;
+        const std::uint64_t falseNegative = truthPixels - truePositive;
+        const std::uint64_t unionPixels =
+            truePositive + falsePositive + falseNegative;
+        if (unionPixels == 0) {
+            continue;
+        }
+
+        const double tp = static_cast<double>(truePositive);
+        const double precisionDenominator = static_cast<double>(predictedPixels);
+        const double recallDenominator = static_cast<double>(truthPixels);
+        const double diceDenominator =
+            2.0 * tp + static_cast<double>(falsePositive + falseNegative);
+        summary.classDice[classId] = diceDenominator == 0.0
+            ? 0.0 : 2.0 * tp / diceDenominator;
+        summary.classIou[classId] = tp / static_cast<double>(unionPixels);
+        summary.meanDice += summary.classDice[classId];
+        summary.meanIou += summary.classIou[classId];
+        summary.macroPrecision += precisionDenominator == 0.0
+            ? 0.0 : tp / precisionDenominator;
+        summary.macroRecall += recallDenominator == 0.0
+            ? 0.0 : tp / recallDenominator;
+        ++activeClasses;
+    }
+
+    if (accumulator.pixelCount > 0) {
+        summary.pixelAccuracy = static_cast<double>(correctPixels) /
+            static_cast<double>(accumulator.pixelCount);
+    }
+    if (activeClasses > 0) {
+        const double divisor = static_cast<double>(activeClasses);
+        summary.meanDice /= divisor;
+        summary.meanIou /= divisor;
+        summary.macroPrecision /= divisor;
+        summary.macroRecall /= divisor;
+    }
     return summary;
 }
 
-// 对全部配对样本执行推理，并与二值标签计算精度。
+// 对全部配对样本执行推理，并与 5 类标签计算像素精度和宏平均指标。
 bool validateAccuracy(
     TensorRTInfer& infer,
     InferenceExecutionResources& resources,
@@ -541,8 +526,7 @@ bool validateAccuracy(
     AccuracyAccumulator accumulator;
     cv::Mat image;
     cv::Mat label;
-    cv::Mat probabilityMask;
-    cv::Mat binaryMask;
+    cv::Mat classMask;
 
     for (std::size_t index = 0; index < samples.size(); ++index) {
         if (!readSample(samples[index], image, label, error)) {
@@ -553,20 +537,19 @@ bool validateAccuracy(
             error += ": " + samples[index].imagePath.string();
             return false;
         }
-        if (!postprocessor.enqueueDownload(probabilityMask, binaryMask, infer.stream())) {
+        if (!postprocessor.enqueueDownload(classMask, infer.stream())) {
             error = "failed to enqueue mask D2H: " + samples[index].imagePath.string();
             return false;
         }
         if (!synchronize(infer.stream(), error)) {
             return false;
         }
-        if (probabilityMask.size() != label.size() || probabilityMask.type() != CV_32FC1 ||
-            binaryMask.size() != label.size() || binaryMask.type() != CV_8UC1) {
+        if (classMask.size() != label.size() || classMask.type() != CV_8UC1) {
             error = "postprocess output does not match label: " + samples[index].imagePath.string();
             return false;
         }
 
-        accumulateAccuracy(probabilityMask, binaryMask, label, accumulator);
+        accumulateAccuracy(classMask, label, accumulator);
         if ((index + 1) % 50 == 0 || index + 1 == samples.size()) {
             std::cout << "[Validate] accuracy " << (index + 1)
                       << '/' << samples.size() << std::endl;
@@ -589,8 +572,7 @@ bool runWarmup(
     std::string& error
 ) {
     cv::Mat image;
-    cv::Mat probabilityMask;
-    cv::Mat binaryMask;
+    cv::Mat classMask;
     cv::Mat visualizedImage;
 
     for (std::size_t index = 0; index < config.warmupIterations; ++index) {
@@ -611,13 +593,12 @@ bool runWarmup(
                 imageStep,
                 image.cols,
                 image.rows,
-                postprocessor.probabilityDeviceBuffer(),
-                postprocessor.binaryDeviceBuffer(),
+                postprocessor.classMaskDeviceBuffer(),
                 infer.stream())) {
             error = "CUDA visualization failed during warmup";
             return false;
         }
-        if (!postprocessor.enqueueDownload(probabilityMask, binaryMask, infer.stream())) {
+        if (!postprocessor.enqueueDownload(classMask, infer.stream())) {
             error = "failed to enqueue warmup mask D2H";
             return false;
         }
@@ -687,8 +668,7 @@ bool benchmarkPerformance(
     timings.endToEnd.reserve(config.benchmarkIterations);
 
     cv::Mat image;
-    cv::Mat probabilityMask;
-    cv::Mat binaryMask;
+    cv::Mat classMask;
     cv::Mat visualizedImage;
     for (std::size_t index = 0; index < config.benchmarkIterations; ++index) {
         image = cv::imread(
@@ -746,6 +726,7 @@ bool benchmarkPerformance(
             infer.outputDeviceBuffer(),
             infer.outputBufferBytes(),
             infer.outputElementSize(),
+            infer.outputChannels(),
             infer.outputWidth(),
             infer.outputHeight(),
             image.cols,
@@ -766,8 +747,7 @@ bool benchmarkPerformance(
                 imageStep,
                 image.cols,
                 image.rows,
-                postprocessor.probabilityDeviceBuffer(),
-                postprocessor.binaryDeviceBuffer(),
+                postprocessor.classMaskDeviceBuffer(),
                 infer.stream());
             if (!visualizationTimer.stop() || !visualizationOk) {
                 error = "CUDA visualization failed during benchmark";
@@ -779,8 +759,7 @@ bool benchmarkPerformance(
             error = "failed to start D2H timer";
             return false;
         }
-        const bool maskDownloadOk = postprocessor.enqueueDownload(
-            probabilityMask, binaryMask, infer.stream());
+        const bool maskDownloadOk = postprocessor.enqueueDownload(classMask, infer.stream());
         const bool visualizationDownloadOk = !config.includeVisualization ||
             visualizer.enqueueDownload(
                 resources.imageDeviceBuffer(),
@@ -913,8 +892,10 @@ bool writeCsv(
         return false;
     }
 
-    output << "engine,engine_path,images,pixels,global_dice,mean_dice,"
-              "global_iou,mean_iou,precision,recall,mae,rmse,"
+    output << "engine,engine_path,images,pixels,pixel_accuracy,mean_dice,"
+              "mean_iou,macro_precision,macro_recall,"
+              "background_dice,burn_dice,crack_tear_dice,material_loss_dice,deformation_dice,"
+              "background_iou,burn_iou,crack_tear_iou,material_loss_iou,deformation_iou,"
               "h2d_mean_ms,h2d_p50_ms,h2d_p95_ms,h2d_p99_ms,"
               "pre_mean_ms,pre_p50_ms,pre_p95_ms,pre_p99_ms,"
               "infer_mean_ms,infer_p50_ms,infer_p95_ms,infer_p99_ms,"
@@ -922,7 +903,7 @@ bool writeCsv(
               "visualize_mean_ms,visualize_p50_ms,visualize_p95_ms,visualize_p99_ms,"
               "d2h_mean_ms,d2h_p50_ms,d2h_p95_ms,d2h_p99_ms,"
               "e2e_mean_ms,e2e_p50_ms,e2e_p95_ms,e2e_p99_ms,fps,"
-              "dice_delta_vs_fp32,iou_delta_vs_fp32,mae_delta_vs_fp32\n";
+              "pixel_accuracy_delta_vs_fp32,dice_delta_vs_fp32,iou_delta_vs_fp32\n";
     output << std::fixed << std::setprecision(8);
 
     const EngineValidationResult* fp32 = nullptr;
@@ -938,14 +919,17 @@ bool writeCsv(
                << ',' << csvString(result.enginePath)
                << ',' << result.accuracy.imageCount
                << ',' << result.accuracy.pixelCount
-               << ',' << result.accuracy.globalDice
+               << ',' << result.accuracy.pixelAccuracy
                << ',' << result.accuracy.meanDice
-               << ',' << result.accuracy.globalIou
                << ',' << result.accuracy.meanIou
-               << ',' << result.accuracy.precision
-               << ',' << result.accuracy.recall
-               << ',' << result.accuracy.mae
-               << ',' << result.accuracy.rmse;
+               << ',' << result.accuracy.macroPrecision
+               << ',' << result.accuracy.macroRecall;
+        for (const double value : result.accuracy.classDice) {
+            output << ',' << value;
+        }
+        for (const double value : result.accuracy.classIou) {
+            output << ',' << value;
+        }
         writeTiming(output, result.performance.h2d);
         writeTiming(output, result.performance.preprocess);
         writeTiming(output, result.performance.inference);
@@ -955,9 +939,9 @@ bool writeCsv(
         writeTiming(output, result.performance.endToEnd);
         output << ',' << result.performance.fps;
         if (fp32 != nullptr) {
-            output << ',' << result.accuracy.globalDice - fp32->accuracy.globalDice
-                   << ',' << result.accuracy.globalIou - fp32->accuracy.globalIou
-                   << ',' << result.accuracy.mae - fp32->accuracy.mae;
+            output << ',' << result.accuracy.pixelAccuracy - fp32->accuracy.pixelAccuracy
+                   << ',' << result.accuracy.meanDice - fp32->accuracy.meanDice
+                   << ',' << result.accuracy.meanIou - fp32->accuracy.meanIou;
         } else {
             output << ",,,";
         }
@@ -974,10 +958,6 @@ bool validateConfig(const ValidationConfig& config, std::string& error) {
     }
     if (config.outputCsv.empty()) {
         error = "CSV output path is empty";
-        return false;
-    }
-    if (config.maskThreshold < 0.0f || config.maskThreshold > 1.0f) {
-        error = "mask threshold must be in [0, 1]";
         return false;
     }
     if (config.benchmarkIterations == 0) {
@@ -1049,7 +1029,7 @@ bool EngineValidator::run(
         preprocessConfig.mean = config_.mean;
         preprocessConfig.std = config_.std;
         CudaPreprocessor preprocessor(preprocessConfig);
-        SegPostprocessor postprocessor({config_.maskThreshold});
+        SegPostprocessor postprocessor;
         Visualizer visualizer;
         InferenceExecutionResources executionResources;
         if (!executionResources.initialize(

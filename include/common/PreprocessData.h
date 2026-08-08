@@ -8,7 +8,8 @@ struct PreprocessConfig {
     int inputWidth = 352;
     int inputHeight = 352;
 
-    // BGR 顺序，数值基于原始 0-255 像素尺度。
+    // BGR 顺序；对应 mean=[0.551,0.619,0.532]*255，
+    // std=[0.241,0.236,0.244]*255。
     std::array<float, 3> mean{140.505f, 157.845f, 135.66f};
     std::array<float, 3> std{61.455f, 60.18f, 62.22f};
 };

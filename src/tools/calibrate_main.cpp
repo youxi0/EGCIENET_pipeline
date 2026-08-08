@@ -65,9 +65,9 @@ void printUsage(const char* application) {
     std::cout
         << "Usage:\n"
         << "  " << application
-        << " --onnx models/egcinet_352.onnx"
+        << " --onnx models/egcienet_352_multiclass.onnx"
         << " --calib_dir datasets/images/calibration"
-        << " --calib_cache models/egcinet_352_int8.cache\n\n"
+        << " --calib_cache models/egcienet_352_multiclass_int8.cache\n\n"
         << "Options:\n"
         << "  --input_name       input tensor name, default image\n"
         << "  --input_w          input width, default 352\n"

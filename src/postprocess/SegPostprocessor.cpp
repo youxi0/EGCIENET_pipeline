@@ -1,5 +1,7 @@
 #include "postprocess/SegPostprocessor.h"
 
+#include "common/SegmentationClasses.h"
+
 #include <cuda_fp16.h>
 
 #include <iostream>
@@ -8,19 +10,17 @@
 void launchSegPostprocessKernel(
     const void* modelMask,
     size_t modelElementSize,
+    int modelChannels,
     int modelWidth,
     int modelHeight,
-    float* probabilityMask,
-    std::uint8_t* binaryMask,
+    std::uint8_t* classMask,
     int outputWidth,
     int outputHeight,
-    float threshold,
     cudaStream_t stream
 );
 
 namespace {
 
-// 统一检查后处理阶段的 CUDA 调用。
 bool checkCuda(cudaError_t status, const char* operation) {
     if (status == cudaSuccess) {
         return true;
@@ -31,35 +31,68 @@ bool checkCuda(cudaError_t status, const char* operation) {
     return false;
 }
 
-} // namespace
-
-SegPostprocessor::SegPostprocessor(SegPostprocessConfig config)
-    : config_(config) {}
-
-bool SegPostprocessor::attachOutputBuffers(
-    float* probabilityDevice,
-    size_t probabilityBufferBytes,
-    std::uint8_t* binaryDevice,
-    size_t binaryBufferBytes
+bool checkedModelBytes(
+    int channels,
+    int width,
+    int height,
+    size_t elementSize,
+    size_t& requiredBytes
 ) noexcept {
-    if (probabilityDevice == nullptr || probabilityBufferBytes == 0 ||
-        binaryDevice == nullptr || binaryBufferBytes == 0) {
+    requiredBytes = 0;
+    if (channels <= 0 || width <= 0 || height <= 0 || elementSize == 0) {
         return false;
     }
-    probabilityDevice_ = probabilityDevice;
-    probabilityBufferBytes_ = probabilityBufferBytes;
-    binaryDevice_ = binaryDevice;
-    binaryBufferBytes_ = binaryBufferBytes;
+
+    size_t elements = static_cast<size_t>(channels);
+    if (elements > std::numeric_limits<size_t>::max() /
+            static_cast<size_t>(height)) {
+        return false;
+    }
+    elements *= static_cast<size_t>(height);
+    if (elements > std::numeric_limits<size_t>::max() /
+            static_cast<size_t>(width)) {
+        return false;
+    }
+    elements *= static_cast<size_t>(width);
+    if (elements > std::numeric_limits<size_t>::max() / elementSize) {
+        return false;
+    }
+    requiredBytes = elements * elementSize;
+    return true;
+}
+
+bool checkedOutputPixels(int width, int height, size_t& pixels) noexcept {
+    pixels = 0;
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    if (static_cast<size_t>(height) >
+        std::numeric_limits<size_t>::max() / static_cast<size_t>(width)) {
+        return false;
+    }
+    pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
+    return true;
+}
+
+} // namespace
+
+bool SegPostprocessor::attachOutputBuffer(
+    std::uint8_t* classMaskDevice,
+    size_t classMaskBufferBytes
+) noexcept {
+    if (classMaskDevice == nullptr || classMaskBufferBytes == 0) {
+        return false;
+    }
+    classMaskDevice_ = classMaskDevice;
+    classMaskBufferBytes_ = classMaskBufferBytes;
     outputWidth_ = 0;
     outputHeight_ = 0;
     return true;
 }
 
-void SegPostprocessor::detachOutputBuffers() noexcept {
-    probabilityDevice_ = nullptr;
-    binaryDevice_ = nullptr;
-    probabilityBufferBytes_ = 0;
-    binaryBufferBytes_ = 0;
+void SegPostprocessor::detachOutputBuffer() noexcept {
+    classMaskDevice_ = nullptr;
+    classMaskBufferBytes_ = 0;
     outputWidth_ = 0;
     outputHeight_ = 0;
 }
@@ -68,6 +101,7 @@ bool SegPostprocessor::process(
     const void* modelMaskDevice,
     size_t modelBufferBytes,
     size_t modelElementSize,
+    int modelChannels,
     int modelWidth,
     int modelHeight,
     int outputWidth,
@@ -76,9 +110,8 @@ bool SegPostprocessor::process(
 ) {
     outputWidth_ = 0;
     outputHeight_ = 0;
-
-    if (probabilityDevice_ == nullptr || binaryDevice_ == nullptr) {
-        std::cerr << "[Seg Postprocess] output buffers are not attached" << std::endl;
+    if (classMaskDevice_ == nullptr) {
+        std::cerr << "[Seg Postprocess] output buffer is not attached" << std::endl;
         return false;
     }
 
@@ -86,12 +119,11 @@ bool SegPostprocessor::process(
             modelMaskDevice,
             modelBufferBytes,
             modelElementSize,
+            modelChannels,
             modelWidth,
             modelHeight,
-            probabilityDevice_,
-            probabilityBufferBytes_,
-            binaryDevice_,
-            binaryBufferBytes_,
+            classMaskDevice_,
+            classMaskBufferBytes_,
             outputWidth,
             outputHeight,
             stream)) {
@@ -107,186 +139,120 @@ bool SegPostprocessor::processToBuffers(
     const void* modelMaskDevice,
     size_t modelBufferBytes,
     size_t modelElementSize,
+    int modelChannels,
     int modelWidth,
     int modelHeight,
-    float* probabilityDevice,
-    size_t probabilityBufferBytes,
-    std::uint8_t* binaryDevice,
-    size_t binaryBufferBytes,
+    std::uint8_t* classMaskDevice,
+    size_t classMaskBufferBytes,
     int outputWidth,
     int outputHeight,
     cudaStream_t stream
 ) const {
-
-    if (modelMaskDevice == nullptr || probabilityDevice == nullptr ||
-        binaryDevice == nullptr) {
-        std::cerr << "[Seg Postprocess] device buffer is null" << std::endl;
+    if (modelMaskDevice == nullptr || classMaskDevice == nullptr || stream == nullptr) {
+        std::cerr << "[Seg Postprocess] device buffer or stream is null" << std::endl;
         return false;
     }
-
     if (modelElementSize != sizeof(float) && modelElementSize != sizeof(__half)) {
-        std::cerr << "[Seg Postprocess] only FP32 or FP16 model output is supported" << std::endl;
+        std::cerr << "[Seg Postprocess] only FP32 or FP16 model output is supported"
+                  << std::endl;
+        return false;
+    }
+    if (modelChannels != egcinet::segmentation::kClassCount) {
+        std::cerr << "[Seg Postprocess] expected 5 output channels, got "
+                  << modelChannels << std::endl;
         return false;
     }
 
-    if (modelWidth <= 0 || modelHeight <= 0 || outputWidth <= 0 || outputHeight <= 0) {
-        std::cerr << "[Seg Postprocess] invalid input or output shape" << std::endl;
+    size_t requiredModelBytes = 0;
+    if (!checkedModelBytes(
+            modelChannels,
+            modelWidth,
+            modelHeight,
+            modelElementSize,
+            requiredModelBytes) ||
+        requiredModelBytes > modelBufferBytes) {
+        std::cerr << "[Seg Postprocess] model output buffer is too small or shape overflows"
+                  << std::endl;
         return false;
     }
 
-    const size_t modelWidthValue = static_cast<size_t>(modelWidth);
-    const size_t modelHeightValue = static_cast<size_t>(modelHeight);
-    if (modelHeightValue > std::numeric_limits<size_t>::max() / modelWidthValue) {
-        std::cerr << "[Seg Postprocess] model pixel count overflow" << std::endl;
-        return false;
-    }
-
-    const size_t modelPixels = modelWidthValue * modelHeightValue;
-    if (modelPixels > std::numeric_limits<size_t>::max() / modelElementSize ||
-        modelPixels * modelElementSize > modelBufferBytes) {
-        std::cerr << "[Seg Postprocess] model output buffer is too small" << std::endl;
-        return false;
-    }
-
-    if (config_.maskThreshold < 0.0f || config_.maskThreshold > 1.0f) {
-        std::cerr << "[Seg Postprocess] mask threshold must be in [0, 1]" << std::endl;
-        return false;
-    }
-
-    const size_t width = static_cast<size_t>(outputWidth);
-    const size_t height = static_cast<size_t>(outputHeight);
-    if (height > std::numeric_limits<size_t>::max() / width) {
-        std::cerr << "[Seg Postprocess] output pixel count overflow" << std::endl;
-        return false;
-    }
-
-    const size_t outputPixels = width * height;
-    if (outputPixels > std::numeric_limits<size_t>::max() / sizeof(float) ||
-        probabilityBufferBytes < outputPixels * sizeof(float) ||
-        binaryBufferBytes < outputPixels * sizeof(std::uint8_t)) {
-        std::cerr << "[Seg Postprocess] output buffer is too small" << std::endl;
+    size_t outputPixels = 0;
+    if (!checkedOutputPixels(outputWidth, outputHeight, outputPixels) ||
+        classMaskBufferBytes < outputPixels * sizeof(std::uint8_t)) {
+        std::cerr << "[Seg Postprocess] class mask buffer is too small or shape is invalid"
+                  << std::endl;
         return false;
     }
 
     launchSegPostprocessKernel(
         modelMaskDevice,
         modelElementSize,
+        modelChannels,
         modelWidth,
         modelHeight,
-        probabilityDevice,
-        binaryDevice,
+        classMaskDevice,
         outputWidth,
         outputHeight,
-        config_.maskThreshold,
         stream
     );
-
-    if (!checkCuda(cudaGetLastError(), "kernel launch")) {
-        return false;
-    }
-
-    return true;
+    return checkCuda(cudaGetLastError(), "argmax kernel launch");
 }
 
 bool SegPostprocessor::enqueueDownload(
-    cv::Mat& probabilityMask,
-    cv::Mat& binaryMask,
+    cv::Mat& classMask,
     cudaStream_t stream
 ) const {
-    if (probabilityDevice_ == nullptr || binaryDevice_ == nullptr ||
-        outputWidth_ <= 0 || outputHeight_ <= 0) {
+    if (classMaskDevice_ == nullptr || outputWidth_ <= 0 || outputHeight_ <= 0) {
         std::cerr << "[Seg Postprocess] no valid GPU result to download" << std::endl;
         return false;
     }
-
     return enqueueDownloadFromBuffers(
-        probabilityDevice_,
-        probabilityBufferBytes_,
-        binaryDevice_,
-        binaryBufferBytes_,
+        classMaskDevice_,
+        classMaskBufferBytes_,
         outputWidth_,
         outputHeight_,
-        probabilityMask,
-        binaryMask,
+        classMask,
         stream);
 }
 
 bool SegPostprocessor::enqueueDownloadFromBuffers(
-    const float* probabilityDevice,
-    size_t probabilityBufferBytes,
-    const std::uint8_t* binaryDevice,
-    size_t binaryBufferBytes,
+    const std::uint8_t* classMaskDevice,
+    size_t classMaskBufferBytes,
     int outputWidth,
     int outputHeight,
-    cv::Mat& probabilityMask,
-    cv::Mat& binaryMask,
+    cv::Mat& classMask,
     cudaStream_t stream
 ) const {
-    if (probabilityDevice == nullptr || binaryDevice == nullptr ||
-        outputWidth <= 0 || outputHeight <= 0) {
-        std::cerr << "[Seg Postprocess] invalid download buffer or shape" << std::endl;
+    size_t pixelCount = 0;
+    if (classMaskDevice == nullptr || stream == nullptr ||
+        !checkedOutputPixels(outputWidth, outputHeight, pixelCount) ||
+        classMaskBufferBytes < pixelCount * sizeof(std::uint8_t)) {
+        std::cerr << "[Seg Postprocess] invalid class mask download buffer or shape"
+                  << std::endl;
         return false;
     }
 
-    const size_t width = static_cast<size_t>(outputWidth);
-    const size_t height = static_cast<size_t>(outputHeight);
-    if (height > std::numeric_limits<size_t>::max() / width) {
-        std::cerr << "[Seg Postprocess] download pixel count overflow" << std::endl;
-        return false;
-    }
-    const size_t pixelCount = width * height;
-    if (pixelCount > std::numeric_limits<size_t>::max() / sizeof(float) ||
-        probabilityBufferBytes < pixelCount * sizeof(float) ||
-        binaryBufferBytes < pixelCount * sizeof(std::uint8_t)) {
-        std::cerr << "[Seg Postprocess] download buffer is too small" << std::endl;
-        return false;
-    }
-
-    probabilityMask.create(outputHeight, outputWidth, CV_32F);
-    binaryMask.create(outputHeight, outputWidth, CV_8U);
+    classMask.create(outputHeight, outputWidth, CV_8UC1);
     if (!checkCuda(
             cudaMemcpy2DAsync(
-                probabilityMask.data,
-                probabilityMask.step,
-                probabilityDevice,
-                width * sizeof(float),
-                width * sizeof(float),
-                height,
+                classMask.data,
+                classMask.step,
+                classMaskDevice,
+                static_cast<size_t>(outputWidth),
+                static_cast<size_t>(outputWidth),
+                static_cast<size_t>(outputHeight),
                 cudaMemcpyDeviceToHost,
                 stream
             ),
-            "probability mask D2H")) {
-        probabilityMask.release();
-        binaryMask.release();
+            "class mask D2H")) {
+        classMask.release();
         return false;
     }
-
-    if (!checkCuda(
-            cudaMemcpy2DAsync(
-                binaryMask.data,
-                binaryMask.step,
-                binaryDevice,
-                width * sizeof(std::uint8_t),
-                width * sizeof(std::uint8_t),
-                height,
-                cudaMemcpyDeviceToHost,
-                stream
-            ),
-            "binary mask D2H")) {
-        probabilityMask.release();
-        binaryMask.release();
-        return false;
-    }
-
     return true;
 }
 
-const float* SegPostprocessor::probabilityDeviceBuffer() const noexcept {
-    return probabilityDevice_;
-}
-
-const std::uint8_t* SegPostprocessor::binaryDeviceBuffer() const noexcept {
-    return binaryDevice_;
+const std::uint8_t* SegPostprocessor::classMaskDeviceBuffer() const noexcept {
+    return classMaskDevice_;
 }
 
 int SegPostprocessor::outputWidth() const noexcept {

@@ -1,5 +1,7 @@
 #include "infer/TensorRTInfer.h"
 
+#include "common/SegmentationClasses.h"
+
 #include <cuda_fp16.h>
 
 #include <cstdint>
@@ -192,14 +194,15 @@ bool TensorRTInfer::inspectIOTensors() {
     output_.dims = context_->getTensorShape(output_.name.c_str());
     output_.dataType = engine_->getTensorDataType(output_.name.c_str());
 
-    // 当前预处理和后处理都按固定的 NCHW 单批次分割模型设计。
+    // 当前预处理和后处理都按固定的 NCHW 单批次 5 类分割模型设计。
     if (input_.dims.nbDims != 4 || input_.dims.d[0] != 1 || input_.dims.d[1] != 3) {
         std::cerr << "[TensorRT Infer] input must be [1,3,H,W]" << std::endl;
         return false;
     }
 
-    if (output_.dims.nbDims != 4 || output_.dims.d[0] != 1 || output_.dims.d[1] != 1) {
-        std::cerr << "[TensorRT Infer] output must be [1,1,H,W]" << std::endl;
+    if (output_.dims.nbDims != 4 || output_.dims.d[0] != 1 ||
+        output_.dims.d[1] != egcinet::segmentation::kClassCount) {
+        std::cerr << "[TensorRT Infer] output must be [1,5,H,W]" << std::endl;
         return false;
     }
 
@@ -213,6 +216,13 @@ bool TensorRTInfer::inspectIOTensors() {
         output_.dims.d[2] > std::numeric_limits<int>::max() ||
         output_.dims.d[3] > std::numeric_limits<int>::max()) {
         std::cerr << "[TensorRT Infer] tensor height or width exceeds int range"
+                  << std::endl;
+        return false;
+    }
+
+    if (output_.dims.d[2] != input_.dims.d[2] ||
+        output_.dims.d[3] != input_.dims.d[3]) {
+        std::cerr << "[TensorRT Infer] output spatial shape must match input shape"
                   << std::endl;
         return false;
     }
@@ -374,6 +384,10 @@ nvinfer1::DataType TensorRTInfer::outputDataType() const noexcept {
 
 size_t TensorRTInfer::outputElementSize() const noexcept {
     return isLoaded() ? elementSize(output_.dataType) : 0;
+}
+
+int TensorRTInfer::outputChannels() const noexcept {
+    return isLoaded() ? static_cast<int>(output_.dims.d[1]) : 0;
 }
 
 int TensorRTInfer::outputWidth() const noexcept {
