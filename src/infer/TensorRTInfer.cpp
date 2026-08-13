@@ -5,10 +5,19 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
+#include <sstream>
+#include <unordered_set>
 #include <utility>
+#include <vector>
+
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 
 namespace {
 
@@ -38,6 +47,53 @@ void printDimensions(const nvinfer1::Dims& dims) {
     }
 }
 
+// 自定义插件 engine 必须在反序列化前注册 Creator。动态库句柄保留到进程结束，
+// 因为提前卸载动态库会让 TensorRT 全局注册表中留下失效的 Creator 指针。
+bool loadTensorRTPluginsFromEnvironment() {
+    const char* configured = std::getenv("EGCINET_TRT_PLUGIN_LIBS");
+    if (configured == nullptr || configured[0] == '\0') {
+        return true;
+    }
+
+#if defined(__linux__)
+    // 步骤 1：加锁并记录已加载路径，避免多个 TensorRTInfer 重复 dlopen 同一动态库。
+    static std::mutex mutex;
+    static std::unordered_set<std::string> loadedPaths;
+    static std::vector<void*> libraryHandles;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    std::istringstream stringstream(configured);
+    std::string path;
+    // 步骤 2：环境变量使用冒号分隔多个 .so，逐个执行 dlopen 触发静态注册。
+    while (std::getline(stringstream, path, ':')) {
+        if (path.empty() || loadedPaths.find(path) != loadedPaths.end()) {
+            continue;
+        }
+
+        dlerror();
+        void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (handle == nullptr) {
+            const char* error = dlerror();
+            std::cerr << "[TensorRT Infer] failed to load plugin library '"
+                      << path << "': "
+                      << (error == nullptr ? "unknown dlopen error" : error)
+                      << std::endl;
+            return false;
+        }
+        libraryHandles.push_back(handle);
+        loadedPaths.insert(path);
+        std::cout << "[TensorRT Infer] plugin loaded: " << path << std::endl;
+    }
+    // 步骤 3：所有 Creator 注册完成后，调用方才可以继续反序列化 engine。
+    return true;
+#else
+    std::cerr << "[TensorRT Infer] EGCINET_TRT_PLUGIN_LIBS is only supported "
+                 "by the Linux deployment build"
+              << std::endl;
+    return false;
+#endif
+}
+
 } // 匿名命名空间
 
 TensorRTInfer::TensorRTInfer(std::string enginePath)
@@ -55,6 +111,10 @@ bool TensorRTInfer::load() {
 
     if (config_.enginePath.empty()) {
         std::cerr << "[TensorRT Infer] engine path is empty" << std::endl;
+        return false;
+    }
+
+    if (!loadTensorRTPluginsFromEnvironment()) {
         return false;
     }
 

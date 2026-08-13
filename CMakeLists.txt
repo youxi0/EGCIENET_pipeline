@@ -6,14 +6,23 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(EGCINET_BUILD_PIPELINE "Build the runtime inspection pipeline targets" OFF)
-option(EGCINET_BUILD_INT8_CALIBRATOR "Build the INT8 calibration cache tool" ON)
+option(EGCINET_BUILD_PIPELINE "Build the runtime inspection pipeline targets" ON)
+option(EGCINET_BUILD_INT8_CALIBRATOR "Build the INT8 calibration cache tool" OFF)
+option(
+    EGCINET_BUILD_BLOCK1_FUSED_PLUGIN
+    "Build the experimental block1 DWConv + GELU TensorRT plugin"
+    ON
+)
 
-find_package(OpenCV REQUIRED)
 find_package(CUDAToolkit REQUIRED)
-find_package(Threads REQUIRED)
+if(EGCINET_BUILD_PIPELINE OR EGCINET_BUILD_INT8_CALIBRATOR)
+    find_package(OpenCV REQUIRED)
+    find_package(Threads REQUIRED)
+endif()
 
+# TENSORRT_ROOT写入cmake缓存，方便用户在命令行或CMake GUI中修改TensorRT安装路径。
 set(TENSORRT_ROOT "" CACHE PATH "TensorRT installation root")
+# 寻找TensorRT头文件和动态库的路径，支持Jetson的multiarch系统目录。
 set(_TENSORRT_ROOT_HINTS
     ${TENSORRT_ROOT}
     $ENV{TENSORRT_ROOT}
@@ -41,6 +50,7 @@ if(CMAKE_LIBRARY_ARCHITECTURE)
         lib/${CMAKE_LIBRARY_ARCHITECTURE}
     )
 endif()
+# 移除重复的路径后缀，避免在多架构系统中重复搜索相同目录。
 list(REMOVE_DUPLICATES _TENSORRT_INCLUDE_SUFFIXES)
 list(REMOVE_DUPLICATES _TENSORRT_LIBRARY_SUFFIXES)
 
@@ -91,6 +101,7 @@ if(NOT EXISTS "${_TENSORRT_VERSION_HEADER}")
     )
 endif()
 
+# 检查tensorrt版本，确保至少为10.0.0。
 file(READ "${_TENSORRT_VERSION_HEADER}" _TENSORRT_VERSION_CONTENT)
 foreach(_TENSORRT_VERSION_PART MAJOR MINOR PATCH BUILD)
     string(
@@ -137,6 +148,39 @@ if(TENSORRT_NVONNXPARSER_LIB)
     message(STATUS "TensorRT ONNX parser library: ${TENSORRT_NVONNXPARSER_LIB}")
 endif()
 
+# Pipeline 和自定义插件都包含 .cu 文件，仅在确实需要时启用 CUDA 语言。
+if(EGCINET_BUILD_PIPELINE OR EGCINET_BUILD_BLOCK1_FUSED_PLUGIN)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
+
+# 单独生成插件动态库，便于与现有 engine/runtime 做版本隔离和独立回退。
+if(EGCINET_BUILD_BLOCK1_FUSED_PLUGIN)
+    add_library(egcinet_block1_fused_plugin SHARED
+        src/plugins/Block1FusedDwconvGeluKernel.cu
+        src/plugins/Block1FusedDwconvGeluPlugin.cpp
+    )
+
+    target_include_directories(egcinet_block1_fused_plugin PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${TENSORRT_INCLUDE_DIR}
+    )
+
+    target_link_libraries(egcinet_block1_fused_plugin PRIVATE
+        ${TENSORRT_NVINFER_LIB}
+        CUDA::cudart
+    )
+
+    set_target_properties(egcinet_block1_fused_plugin PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+        OUTPUT_NAME egcinet_block1_fused_plugin
+    )
+endif()
+
 if(EGCINET_BUILD_INT8_CALIBRATOR)
     if(NOT TENSORRT_NVONNXPARSER_LIB)
         message(FATAL_ERROR
@@ -172,10 +216,6 @@ if(EGCINET_BUILD_INT8_CALIBRATOR)
 endif()
 
 if(EGCINET_BUILD_PIPELINE)
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
     add_library(egcinet_runtime STATIC
         src/acquisition/ImageFolderSource.cpp
         src/acquisition/VideoSource.cpp
@@ -203,6 +243,7 @@ if(EGCINET_BUILD_PIPELINE)
         ${OpenCV_LIBS}
         ${TENSORRT_NVINFER_LIB}
         CUDA::cudart
+        ${CMAKE_DL_LIBS}
         Threads::Threads
     )
 
