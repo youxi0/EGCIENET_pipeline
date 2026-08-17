@@ -13,6 +13,11 @@ option(
     "Build the experimental block1 DWConv + GELU TensorRT plugin"
     ON
 )
+option(
+    EGCINET_BUILD_BLOCK1_PACKED_DWCONV_PLUGIN
+    "Build the block1 packed-weight DWConv TensorRT plugin"
+    OFF
+)
 
 find_package(CUDAToolkit REQUIRED)
 if(EGCINET_BUILD_PIPELINE OR EGCINET_BUILD_INT8_CALIBRATOR)
@@ -149,10 +154,37 @@ if(TENSORRT_NVONNXPARSER_LIB)
 endif()
 
 # Pipeline 和自定义插件都包含 .cu 文件，仅在确实需要时启用 CUDA 语言。
-if(EGCINET_BUILD_PIPELINE OR EGCINET_BUILD_BLOCK1_FUSED_PLUGIN)
+if(EGCINET_BUILD_PIPELINE OR EGCINET_BUILD_BLOCK1_FUSED_PLUGIN OR
+   EGCINET_BUILD_BLOCK1_PACKED_DWCONV_PLUGIN)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
+
+# V11 插件只接收激活；half2 权重和 bias 作为序列化字段由插件持有。
+if(EGCINET_BUILD_BLOCK1_PACKED_DWCONV_PLUGIN)
+    add_library(egcinet_block1_packed_dwconv_plugin SHARED
+        src/plugins/Block1PackedDwconvKernel.cu
+        src/plugins/Block1PackedDwconvPlugin.cpp
+    )
+
+    target_include_directories(egcinet_block1_packed_dwconv_plugin PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${TENSORRT_INCLUDE_DIR}
+    )
+
+    target_link_libraries(egcinet_block1_packed_dwconv_plugin PRIVATE
+        ${TENSORRT_NVINFER_LIB}
+        CUDA::cudart
+    )
+
+    set_target_properties(egcinet_block1_packed_dwconv_plugin PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+        OUTPUT_NAME egcinet_block1_packed_dwconv_plugin
+    )
 endif()
 
 # 单独生成插件动态库，便于与现有 engine/runtime 做版本隔离和独立回退。
