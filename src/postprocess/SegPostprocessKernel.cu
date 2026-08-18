@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <math_constants.h>
 #include <cuda_runtime.h>
 
 #include <cmath>

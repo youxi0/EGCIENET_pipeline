@@ -33,7 +33,7 @@ mkdir -p "$(dirname "${LAYER_INFO}")"
 TRTEXEC_ARGS=(
     "--onnx=${ONNX}"
     "--saveEngine=${ENGINE}"
-    "--dynamicPlugins=${PLUGIN_SO}"
+    "--staticPlugins=${PLUGIN_SO}"
     --int8
     --fp16
     "--memPoolSize=workspace:${WORKSPACE_MIB}"

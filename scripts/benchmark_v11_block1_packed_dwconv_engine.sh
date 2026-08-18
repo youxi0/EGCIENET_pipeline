@@ -9,7 +9,7 @@ ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v11_block1_
 PLUGIN_SO="${PLUGIN_SO:-${PROJECT_ROOT}/build/block1_packed_dwconv_plugin/lib/libegcinet_block1_packed_dwconv_plugin.so}"
 WARMUP_MS="${WARMUP_MS:-1000}"
 DURATION_SECONDS="${DURATION_SECONDS:-10}"
-ITERATIONS="${ITERATIONS:-1000}"
+ITERATIONS="${ITERATIONS:-10}"
 PROFILE_JSON="${PROFILE_JSON:-${ENGINE%.engine}_profile.json}"
 
 TRTEXEC=$(resolve_trtexec)
@@ -30,7 +30,7 @@ mkdir -p "$(dirname "${PROFILE_JSON}")"
 echo "[INFO] benchmark V11 packed DWConv with native TensorRT GELU"
 "${TRTEXEC}" \
     "--loadEngine=${ENGINE}" \
-    "--dynamicPlugins=${PLUGIN_SO}" \
+    "--staticPlugins=${PLUGIN_SO}" \
     --noDataTransfers \
     --useCudaGraph \
     "--warmUp=${WARMUP_MS}" \
