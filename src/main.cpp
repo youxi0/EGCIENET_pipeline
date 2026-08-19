@@ -110,7 +110,10 @@ int parseIntegerRange(
 
 std::unique_ptr<ImageSource> createSource(
     const std::string& sourceType,
-    const std::string& sourcePath
+    const std::string& sourcePath,
+    int cameraWidth,
+    int cameraHeight,
+    int cameraFps
 ) {
     if (sourceType == "folder") {
         return std::make_unique<ImageFolderSource>(sourcePath);
@@ -124,7 +127,8 @@ std::unique_ptr<ImageSource> createSource(
         if (consumed != sourcePath.size() || cameraId < 0) {
             throw std::invalid_argument("camera source must be a non-negative integer");
         }
-        return std::make_unique<VideoSource>(cameraId);
+        return std::make_unique<VideoSource>(
+            cameraId, cameraWidth, cameraHeight, cameraFps);
     }
     throw std::invalid_argument("--type must be folder, video or camera");
 }
@@ -140,10 +144,14 @@ void printUsage(const char* app) {
         << "  --queue_size   frame slot count, range 1-16, default 3\n"
         << "  --max_width    maximum source width, default 1920\n"
         << "  --max_height   maximum source height, default 1080\n"
+        << "  --camera_width Jetson CSI capture width, default 1920\n"
+        << "  --camera_height Jetson CSI capture height, default 1080\n"
+        << "  --camera_fps   Jetson CSI capture FPS, default 30\n"
         << "  --mean         B,G,R raw-pixel mean, default 140.505,157.845,135.66\n"
         << "  --std          B,G,R raw-pixel std, default 61.455,60.18,62.22\n"
         << "  --save_dir     save class mask and visualization; empty means disabled\n"
         << "  --log_dir      runtime log directory, default results/logs\n"
+        << "  --log_interval frame timing log interval; 0 disables it, default 30\n"
         << "  --tcp_host     upper-computer address; empty means TCP disabled\n"
         << "  --tcp_port     upper-computer listening port, default 9000\n"
         << "  --tcp_queue    asynchronous display queue size, range 1-8, default 2\n"
@@ -160,20 +168,24 @@ std::string frameStem(std::uint64_t frameId) {
 void handleResult(
     const FrameData& frame,
     const std::string& saveDirectory,
-    egcinet::network::TcpFrameSender* tcpSender
+    egcinet::network::TcpFrameSender* tcpSender,
+    int frameLogInterval
 ) {
-    std::ostringstream timingLog;
-    timingLog << std::fixed << std::setprecision(3)
-              << "[Pipeline] frame=" << frame.frameId
-              << " acquire=" << frame.cost.acquire_ms << " ms"
-              << " h2d=" << frame.cost.h2d_ms << " ms"
-              << " preprocess=" << frame.cost.preprocess_ms << " ms"
-              << " infer=" << frame.cost.infer_ms << " ms"
-              << " postprocess=" << frame.cost.postprocess_ms << " ms"
-              << " visualize=" << frame.cost.visualize_ms << " ms"
-              << " d2h=" << frame.cost.d2h_ms << " ms"
-              << " total=" << frame.cost.total_ms << " ms";
-    utils::FileLogger::instance().info(timingLog.str());
+    const auto interval = static_cast<std::uint64_t>(frameLogInterval);
+    if (interval > 0 && frame.frameId % interval == interval - 1) {
+        std::ostringstream timingLog;
+        timingLog << std::fixed << std::setprecision(3)
+                  << "[Pipeline] frame=" << frame.frameId
+                  << " acquire=" << frame.cost.acquire_ms << " ms"
+                  << " h2d=" << frame.cost.h2d_ms << " ms"
+                  << " preprocess=" << frame.cost.preprocess_ms << " ms"
+                  << " infer=" << frame.cost.infer_ms << " ms"
+                  << " postprocess=" << frame.cost.postprocess_ms << " ms"
+                  << " visualize=" << frame.cost.visualize_ms << " ms"
+                  << " d2h=" << frame.cost.d2h_ms << " ms"
+                  << " total=" << frame.cost.total_ms << " ms";
+        utils::FileLogger::instance().info(timingLog.str());
+    }
 
     if (tcpSender != nullptr) {
         tcpSender->enqueue(frame);
@@ -216,6 +228,15 @@ int main(int argc, char** argv) {
         const std::string saveDirectory = getArg(argc, argv, "--save_dir");
         const std::string logDirectory =
             getArg(argc, argv, "--log_dir", "results/logs");
+        const int frameLogInterval = parseIntegerRange(
+            getArg(argc, argv, "--log_interval", "30"),
+            "--log_interval", 0, 1000000);
+        const int cameraWidth = parsePositiveDimension(
+            getArg(argc, argv, "--camera_width", "1920"), "--camera_width");
+        const int cameraHeight = parsePositiveDimension(
+            getArg(argc, argv, "--camera_height", "1080"), "--camera_height");
+        const int cameraFps = parseIntegerRange(
+            getArg(argc, argv, "--camera_fps", "30"), "--camera_fps", 1, 240);
         const std::string tcpHost = getArg(argc, argv, "--tcp_host");
         const int tcpPort = parseIntegerRange(
             getArg(argc, argv, "--tcp_port", "9000"), "--tcp_port", 1, 65535);
@@ -260,8 +281,12 @@ int main(int argc, char** argv) {
             getArg(argc, argv, "--std", "61.455,60.18,62.22"),
             "--std");
         config.enableVisualization = !saveDirectory.empty() || tcpSender != nullptr;
-        config.resultCallback = [saveDirectory, sender = tcpSender.get()](const FrameData& frame) {
-            handleResult(frame, saveDirectory, sender);
+        config.resultCallback = [
+            saveDirectory,
+            sender = tcpSender.get(),
+            frameLogInterval
+        ](const FrameData& frame) {
+            handleResult(frame, saveDirectory, sender, frameLogInterval);
         };
 
         std::ostringstream startupLog;
@@ -271,13 +296,17 @@ int main(int argc, char** argv) {
                    << ", slots=" << config.queueSize
                    << ", max_source=" << config.maxSourceWidth << "x"
                    << config.maxSourceHeight
+                   << ", camera=" << cameraWidth << "x" << cameraHeight
+                   << "@" << cameraFps
+                   << ", frame_log_interval=" << frameLogInterval
                    << ", visualization=" << (config.enableVisualization ? "on" : "off")
                    << ", tcp=" << (tcpHost.empty()
                        ? "off"
                        : tcpHost + ':' + std::to_string(tcpPort));
         utils::FileLogger::instance().info(startupLog.str());
 
-        auto source = createSource(sourceType, sourcePath);
+        auto source = createSource(
+            sourceType, sourcePath, cameraWidth, cameraHeight, cameraFps);
         egcinet::pipeline::InspectionPipeline pipeline(std::move(source), std::move(config));
         if (!pipeline.start()) {
             return 1;

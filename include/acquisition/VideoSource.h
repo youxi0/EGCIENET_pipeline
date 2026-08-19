@@ -7,7 +7,7 @@
 class VideoSource : public ImageSource {
 public:
     explicit VideoSource(const std::string& video_path);
-    explicit VideoSource(int camera_id);
+    VideoSource(int camera_id, int camera_width, int camera_height, int camera_fps);
 
     bool open() override;
 /*
@@ -31,6 +31,9 @@ public:
 private:
     bool use_camera_ = false;
     int camera_id_ = 0;
+    int camera_width_ = 1920;
+    int camera_height_ = 1080;
+    int camera_fps_ = 30;
     std::string video_path_;
 
     cv::VideoCapture cap_;

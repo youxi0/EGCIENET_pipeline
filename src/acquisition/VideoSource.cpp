@@ -1,14 +1,47 @@
 #include "acquisition/VideoSource.h"
 
 #include <iostream>
+#include <sstream>
+
+namespace {
+
+// Jetson CSI 摄像头输出 RAW Bayer，必须经过 Argus/ISP 去马赛克后再交给 OpenCV。
+std::string buildJetsonCameraPipeline(
+    int cameraId,
+    int width,
+    int height,
+    int fps
+) {
+    std::ostringstream pipeline;
+    pipeline << "nvarguscamerasrc sensor-id=" << cameraId
+             << " ! video/x-raw(memory:NVMM),width=" << width
+             << ",height=" << height
+             << ",framerate=" << fps << "/1,format=NV12"
+             << " ! nvvidconv"
+             << " ! video/x-raw,format=BGRx"
+             << " ! videoconvert"
+             << " ! video/x-raw,format=BGR"
+             << " ! appsink drop=true max-buffers=1 sync=false";
+    return pipeline.str();
+}
+
+} // namespace
 
 VideoSource::VideoSource(const std::string& video_path)
     : use_camera_(false),
       video_path_(video_path) {}
 
-VideoSource::VideoSource(int camera_id)
+VideoSource::VideoSource(
+    int camera_id,
+    int camera_width,
+    int camera_height,
+    int camera_fps
+)
     : use_camera_(true),
-      camera_id_(camera_id) {}
+      camera_id_(camera_id),
+      camera_width_(camera_width),
+      camera_height_(camera_height),
+      camera_fps_(camera_fps) {}
 
 bool VideoSource::open() {
     /*
@@ -20,7 +53,14 @@ bool VideoSource::open() {
     current_index_ = 0;
 
     if (use_camera_) {
-        cap_.open(camera_id_);
+        const std::string cameraPipeline = buildJetsonCameraPipeline(
+            camera_id_, camera_width_, camera_height_, camera_fps_);
+        cap_.open(cameraPipeline, cv::CAP_GSTREAMER);
+        if (!cap_.isOpened()) {
+            std::cerr << "Failed to open Jetson Argus camera pipeline: "
+                      << cameraPipeline << std::endl;
+            return false;
+        }
     } else {
         cap_.open(video_path_);
     }

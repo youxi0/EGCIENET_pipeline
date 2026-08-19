@@ -9,6 +9,7 @@ namespace egcinet::plugins {
 namespace {
 
 constexpr int32_t kOutputsPerTile = 4;
+constexpr int32_t kOutputRowsPerTile = 2;
 constexpr int32_t kFixedSpatialExtent = 88;
 constexpr float kGeluScale = 0.7978845608028654F;
 constexpr float kGeluScaledCubic = 0.035677406936883926F; // scale * 0.044715 常量折叠
@@ -81,6 +82,421 @@ __device__ __forceinline__ void accumulateRowTile(
     multiplyAddHalf2(accumulator3, input3, weight0);
     multiplyAddHalf2(accumulator3, input4, weight1);
     multiplyAddHalf2(accumulator3, input5, weight2);
+}
+
+__device__ __forceinline__ void loadWeightRow(
+    const __half2* packedWeight,
+    int32_t kernelRow,
+    int32_t channelPair,
+    int32_t channelPairs,
+    float2& weight0,
+    float2& weight1,
+    float2& weight2
+) {
+    const int32_t rowOffset = kernelRow * 3 * channelPairs + channelPair;
+    weight0 = loadHalf2AsFloat2(packedWeight + rowOffset);
+    weight1 = loadHalf2AsFloat2(packedWeight + rowOffset + channelPairs);
+    weight2 = loadHalf2AsFloat2(packedWeight + rowOffset + 2 * channelPairs);
+}
+
+__device__ __forceinline__ void loadInteriorInputRowTile(
+    const __half2* inputRowStart,
+    int32_t channelPairs,
+    float2& input0,
+    float2& input1,
+    float2& input2,
+    float2& input3,
+    float2& input4,
+    float2& input5
+) {
+    input0 = loadHalf2AsFloat2(inputRowStart);
+    input1 = loadHalf2AsFloat2(inputRowStart + channelPairs);
+    input2 = loadHalf2AsFloat2(inputRowStart + 2 * channelPairs);
+    input3 = loadHalf2AsFloat2(inputRowStart + 3 * channelPairs);
+    input4 = loadHalf2AsFloat2(inputRowStart + 4 * channelPairs);
+    input5 = loadHalf2AsFloat2(inputRowStart + 5 * channelPairs);
+}
+
+// 固定 88x88 的边界 tile 数量很少，使用完整 padding 逻辑保证首尾行列
+// 正确；内部 tile 则由下面的 4x2 专用 kernel 走无分支快速路径。
+__device__ __forceinline__ void accumulateFixedBoundaryRow(
+    const __half2* input,
+    const __half2* packedWeight,
+    int32_t batchIndex,
+    int32_t outputRow,
+    int32_t tileColumn,
+    int32_t channelPair,
+    int32_t channelPairs,
+    float2& accumulator0,
+    float2& accumulator1,
+    float2& accumulator2,
+    float2& accumulator3
+) {
+    const float2 zero = make_float2(0.0F, 0.0F);
+#pragma unroll
+    for (int32_t kernelRow = 0; kernelRow < 3; ++kernelRow) {
+        const int32_t inputRow = outputRow + kernelRow - 1;
+        if (inputRow < 0 || inputRow >= kFixedSpatialExtent) {
+            continue;
+        }
+
+        const int64_t inputRowPairOffset =
+            (static_cast<int64_t>(batchIndex) * kFixedSpatialExtent + inputRow) *
+                kFixedSpatialExtent * channelPairs +
+            channelPair;
+        const __half2* inputRowStart = input + inputRowPairOffset;
+
+        float2 weight0;
+        float2 weight1;
+        float2 weight2;
+        loadWeightRow(
+            packedWeight,
+            kernelRow,
+            channelPair,
+            channelPairs,
+            weight0,
+            weight1,
+            weight2
+        );
+
+        float2 input0 = zero;
+        if (tileColumn > 0) {
+            input0 = loadHalf2AsFloat2(
+                inputRowStart + (tileColumn - 1) * channelPairs
+            );
+        }
+        const float2 input1 = loadHalf2AsFloat2(
+            inputRowStart + tileColumn * channelPairs
+        );
+        const float2 input2 = loadHalf2AsFloat2(
+            inputRowStart + (tileColumn + 1) * channelPairs
+        );
+        const float2 input3 = loadHalf2AsFloat2(
+            inputRowStart + (tileColumn + 2) * channelPairs
+        );
+        const float2 input4 = loadHalf2AsFloat2(
+            inputRowStart + (tileColumn + 3) * channelPairs
+        );
+        float2 input5 = zero;
+        if (tileColumn + kOutputsPerTile < kFixedSpatialExtent) {
+            input5 = loadHalf2AsFloat2(
+                inputRowStart + (tileColumn + kOutputsPerTile) * channelPairs
+            );
+        }
+
+        accumulateRowTile(
+            accumulator0,
+            accumulator1,
+            accumulator2,
+            accumulator3,
+            input0,
+            input1,
+            input2,
+            input3,
+            input4,
+            input5,
+            weight0,
+            weight1,
+            weight2
+        );
+    }
+}
+
+// 固定 88x88 热路径采用 4x2 二维 tile。相邻两个输出行共同需要 4 行
+// 输入，其中间两行只加载一次；每个权重行只跨相邻两个输入行存活，控制
+// 寄存器生命周期，避免同时常驻全部 9 个 half2 权重。
+template <bool kFuseGelu>
+__global__ __launch_bounds__(128, 10) void block1PackedDwconvHalf2Tile2DKernel(
+    const __half2* __restrict__ input,
+    const __half2* __restrict__ packedWeight,
+    const __half2* __restrict__ packedBias,
+    __half2* __restrict__ output,
+    int32_t channelPairs
+) {
+    const int32_t channelPair = static_cast<int32_t>(threadIdx.x);
+    const int32_t tileColumn =
+        static_cast<int32_t>(blockIdx.x) * kOutputsPerTile;
+    const int32_t tileRow =
+        static_cast<int32_t>(blockIdx.y) * kOutputRowsPerTile;
+    const int32_t batchIndex = static_cast<int32_t>(blockIdx.z);
+
+    const float2 bias = loadHalf2AsFloat2(packedBias + channelPair);
+    float2 upper0 = bias;
+    float2 upper1 = bias;
+    float2 upper2 = bias;
+    float2 upper3 = bias;
+    float2 lower0 = bias;
+    float2 lower1 = bias;
+    float2 lower2 = bias;
+    float2 lower3 = bias;
+
+    const bool isInterior =
+        tileRow > 0 && tileRow + kOutputRowsPerTile < kFixedSpatialExtent &&
+        tileColumn > 0 &&
+        tileColumn + kOutputsPerTile < kFixedSpatialExtent;
+    if (isInterior) {
+        const int64_t rowPairStride =
+            static_cast<int64_t>(kFixedSpatialExtent) * channelPairs;
+        const int64_t firstInputPairOffset =
+            (static_cast<int64_t>(batchIndex) * kFixedSpatialExtent +
+             tileRow - 1) *
+                rowPairStride +
+            static_cast<int64_t>(tileColumn - 1) * channelPairs +
+            channelPair;
+
+        float2 weight00;
+        float2 weight01;
+        float2 weight02;
+        loadWeightRow(
+            packedWeight,
+            0,
+            channelPair,
+            channelPairs,
+            weight00,
+            weight01,
+            weight02
+        );
+        {
+            float2 input0;
+            float2 input1;
+            float2 input2;
+            float2 input3;
+            float2 input4;
+            float2 input5;
+            loadInteriorInputRowTile(
+                input + firstInputPairOffset,
+                channelPairs,
+                input0,
+                input1,
+                input2,
+                input3,
+                input4,
+                input5
+            );
+            accumulateRowTile(
+                upper0,
+                upper1,
+                upper2,
+                upper3,
+                input0,
+                input1,
+                input2,
+                input3,
+                input4,
+                input5,
+                weight00,
+                weight01,
+                weight02
+            );
+        }
+
+        float2 weight10;
+        float2 weight11;
+        float2 weight12;
+        loadWeightRow(
+            packedWeight,
+            1,
+            channelPair,
+            channelPairs,
+            weight10,
+            weight11,
+            weight12
+        );
+        {
+            float2 input0;
+            float2 input1;
+            float2 input2;
+            float2 input3;
+            float2 input4;
+            float2 input5;
+            loadInteriorInputRowTile(
+                input + firstInputPairOffset + rowPairStride,
+                channelPairs,
+                input0,
+                input1,
+                input2,
+                input3,
+                input4,
+                input5
+            );
+            accumulateRowTile(
+                upper0,
+                upper1,
+                upper2,
+                upper3,
+                input0,
+                input1,
+                input2,
+                input3,
+                input4,
+                input5,
+                weight10,
+                weight11,
+                weight12
+            );
+            accumulateRowTile(
+                lower0,
+                lower1,
+                lower2,
+                lower3,
+                input0,
+                input1,
+                input2,
+                input3,
+                input4,
+                input5,
+                weight00,
+                weight01,
+                weight02
+            );
+        }
+
+        float2 weight20;
+        float2 weight21;
+        float2 weight22;
+        loadWeightRow(
+            packedWeight,
+            2,
+            channelPair,
+            channelPairs,
+            weight20,
+            weight21,
+            weight22
+        );
+        {
+            float2 input0;
+            float2 input1;
+            float2 input2;
+            float2 input3;
+            float2 input4;
+            float2 input5;
+            loadInteriorInputRowTile(
+                input + firstInputPairOffset + 2 * rowPairStride,
+                channelPairs,
+                input0,
+                input1,
+                input2,
+                input3,
+                input4,
+                input5
+            );
+            accumulateRowTile(
+                upper0,
+                upper1,
+                upper2,
+                upper3,
+                input0,
+                input1,
+                input2,
+                input3,
+                input4,
+                input5,
+                weight20,
+                weight21,
+                weight22
+            );
+            accumulateRowTile(
+                lower0,
+                lower1,
+                lower2,
+                lower3,
+                input0,
+                input1,
+                input2,
+                input3,
+                input4,
+                input5,
+                weight10,
+                weight11,
+                weight12
+            );
+        }
+
+        {
+            float2 input0;
+            float2 input1;
+            float2 input2;
+            float2 input3;
+            float2 input4;
+            float2 input5;
+            loadInteriorInputRowTile(
+                input + firstInputPairOffset + 3 * rowPairStride,
+                channelPairs,
+                input0,
+                input1,
+                input2,
+                input3,
+                input4,
+                input5
+            );
+            accumulateRowTile(
+                lower0,
+                lower1,
+                lower2,
+                lower3,
+                input0,
+                input1,
+                input2,
+                input3,
+                input4,
+                input5,
+                weight20,
+                weight21,
+                weight22
+            );
+        }
+    } else {
+        accumulateFixedBoundaryRow(
+            input,
+            packedWeight,
+            batchIndex,
+            tileRow,
+            tileColumn,
+            channelPair,
+            channelPairs,
+            upper0,
+            upper1,
+            upper2,
+            upper3
+        );
+        accumulateFixedBoundaryRow(
+            input,
+            packedWeight,
+            batchIndex,
+            tileRow + 1,
+            tileColumn,
+            channelPair,
+            channelPairs,
+            lower0,
+            lower1,
+            lower2,
+            lower3
+        );
+    }
+
+    const int64_t outputPairOffset =
+        ((static_cast<int64_t>(batchIndex) * kFixedSpatialExtent + tileRow) *
+             kFixedSpatialExtent +
+         tileColumn) *
+            channelPairs +
+        channelPair;
+    const int64_t outputRowStride =
+        static_cast<int64_t>(kFixedSpatialExtent) * channelPairs;
+
+    output[outputPairOffset] = convertOutput<kFuseGelu>(upper0);
+    output[outputPairOffset + channelPairs] = convertOutput<kFuseGelu>(upper1);
+    output[outputPairOffset + 2 * channelPairs] =
+        convertOutput<kFuseGelu>(upper2);
+    output[outputPairOffset + 3 * channelPairs] =
+        convertOutput<kFuseGelu>(upper3);
+    output[outputPairOffset + outputRowStride] =
+        convertOutput<kFuseGelu>(lower0);
+    output[outputPairOffset + outputRowStride + channelPairs] =
+        convertOutput<kFuseGelu>(lower1);
+    output[outputPairOffset + outputRowStride + 2 * channelPairs] =
+        convertOutput<kFuseGelu>(lower2);
+    output[outputPairOffset + outputRowStride + 3 * channelPairs] =
+        convertOutput<kFuseGelu>(lower3);
 }
 
 // 一个 CTA 计算同一 batch、同一行的连续 4 个空间位置；一个线程负责
@@ -357,6 +773,27 @@ void launchKernel(
         );
 }
 
+template <bool kFuseGelu>
+void launchFixedTile2DKernel(
+    const void* input,
+    const void* packedWeight,
+    const void* packedBias,
+    void* output,
+    const dim3& grid,
+    const dim3& block,
+    int32_t channelPairs,
+    cudaStream_t stream
+) noexcept {
+    block1PackedDwconvHalf2Tile2DKernel<kFuseGelu>
+        <<<grid, block, 0, stream>>>(
+            static_cast<const __half2*>(input),
+            static_cast<const __half2*>(packedWeight),
+            static_cast<const __half2*>(packedBias),
+            static_cast<__half2*>(output),
+            channelPairs
+        );
+}
+
 } // 匿名命名空间
 
 int32_t launchBlock1PackedDwconv(
@@ -382,67 +819,102 @@ int32_t launchBlock1PackedDwconv(
         return -1;
     }
 
-    const dim3 grid(
-        static_cast<uint32_t>((width + kOutputsPerTile - 1) / kOutputsPerTile),
-        static_cast<uint32_t>(height),
-        static_cast<uint32_t>(batch)
-    );
     const dim3 block(static_cast<uint32_t>(channelPairs));
 
     const bool useFixed88Shape =
         height == kFixedSpatialExtent && width == kFixedSpatialExtent;
-    if (useFixed88Shape && fuseGelu) {
-        launchKernel<true, true>(
-            input,
-            packedWeight,
-            packedBias,
-            output,
-            grid,
-            block,
-            height,
-            width,
-            channelPairs,
-            stream
+    const bool useFixedTile2D = useFixed88Shape && channelPairs <= 128;
+    if (useFixedTile2D) {
+        const dim3 fixedGrid(
+            static_cast<uint32_t>(
+                kFixedSpatialExtent / kOutputsPerTile),
+            static_cast<uint32_t>(
+                kFixedSpatialExtent / kOutputRowsPerTile),
+            static_cast<uint32_t>(batch)
         );
-    } else if (useFixed88Shape) {
-        launchKernel<true, false>(
-            input,
-            packedWeight,
-            packedBias,
-            output,
-            grid,
-            block,
-            height,
-            width,
-            channelPairs,
-            stream
-        );
-    } else if (fuseGelu) {
-        launchKernel<false, true>(
-            input,
-            packedWeight,
-            packedBias,
-            output,
-            grid,
-            block,
-            height,
-            width,
-            channelPairs,
-            stream
-        );
+        if (fuseGelu) {
+            launchFixedTile2DKernel<true>(
+                input,
+                packedWeight,
+                packedBias,
+                output,
+                fixedGrid,
+                block,
+                channelPairs,
+                stream
+            );
+        } else {
+            launchFixedTile2DKernel<false>(
+                input,
+                packedWeight,
+                packedBias,
+                output,
+                fixedGrid,
+                block,
+                channelPairs,
+                stream
+            );
+        }
     } else {
-        launchKernel<false, false>(
-            input,
-            packedWeight,
-            packedBias,
-            output,
-            grid,
-            block,
-            height,
-            width,
-            channelPairs,
-            stream
+        const dim3 grid(
+            static_cast<uint32_t>(
+                (width + kOutputsPerTile - 1) / kOutputsPerTile),
+            static_cast<uint32_t>(height),
+            static_cast<uint32_t>(batch)
         );
+        if (useFixed88Shape && fuseGelu) {
+            launchKernel<true, true>(
+                input,
+                packedWeight,
+                packedBias,
+                output,
+                grid,
+                block,
+                height,
+                width,
+                channelPairs,
+                stream
+            );
+        } else if (useFixed88Shape) {
+            launchKernel<true, false>(
+                input,
+                packedWeight,
+                packedBias,
+                output,
+                grid,
+                block,
+                height,
+                width,
+                channelPairs,
+                stream
+            );
+        } else if (fuseGelu) {
+            launchKernel<false, true>(
+                input,
+                packedWeight,
+                packedBias,
+                output,
+                grid,
+                block,
+                height,
+                width,
+                channelPairs,
+                stream
+            );
+        } else {
+            launchKernel<false, false>(
+                input,
+                packedWeight,
+                packedBias,
+                output,
+                grid,
+                block,
+                height,
+                width,
+                channelPairs,
+                stream
+            );
+        }
     }
     return cudaPeekAtLastError() == cudaSuccess ? 0 : -1;
 }
