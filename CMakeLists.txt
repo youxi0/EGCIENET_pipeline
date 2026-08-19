@@ -161,7 +161,8 @@ if(EGCINET_BUILD_PIPELINE OR EGCINET_BUILD_BLOCK1_FUSED_PLUGIN OR
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
-# V11 插件只接收激活；half2 权重和 bias 作为序列化字段由插件持有。
+# V11/V12 插件只接收激活；half2 权重和 bias 作为序列化字段由插件持有。
+# V12 通过可选 fuse_gelu 字段在同一个 CUDA kernel 中追加 FastGELU。
 if(EGCINET_BUILD_BLOCK1_PACKED_DWCONV_PLUGIN)
     add_library(egcinet_block1_packed_dwconv_plugin SHARED
         src/plugins/Block1PackedDwconvKernel.cu

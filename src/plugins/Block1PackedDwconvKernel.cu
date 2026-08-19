@@ -9,6 +9,9 @@ namespace egcinet::plugins {
 namespace {
 
 constexpr int32_t kOutputsPerTile = 4;
+constexpr int32_t kFixedSpatialExtent = 88;
+constexpr float kGeluScale = 0.7978845608028654F;
+constexpr float kGeluScaledCubic = 0.035677406936883926F; // scale * 0.044715 常量折叠
 
 __device__ __forceinline__ float2 loadHalf2AsFloat2(const __half2* address) {
     return __half22float2(*address);
@@ -21,6 +24,29 @@ __device__ __forceinline__ void multiplyAddHalf2(
 ) {
     accumulator.x = fmaf(input.x, weight.x, accumulator.x);
     accumulator.y = fmaf(input.y, weight.y, accumulator.y);
+}
+
+// PyTorch GELU 的标准 tanh 近似。__tanhf 直接使用 GPU 快速近似指令；与
+// QuickGELU 相比误差更小，与精确 erff 相比则避免昂贵的 device function。
+__device__ __forceinline__ float fastGelu(float value) {
+    const float xSquared = value * value;
+    const float tanhInput =
+        value * fmaf(kGeluScaledCubic, xSquared, kGeluScale);
+    const float tanhValue = __tanhf(tanhInput);
+
+    const float halfValue = 0.5F * value;
+    return fmaf(halfValue, tanhValue, halfValue);
+}
+
+template <bool kFuseGelu>
+__device__ __forceinline__ __half2 convertOutput(const float2& accumulator) {
+    if constexpr (kFuseGelu) {
+        return __floats2half2_rn(
+            fastGelu(accumulator.x),
+            fastGelu(accumulator.y)
+        );
+    }
+    return __floats2half2_rn(accumulator.x, accumulator.y);
 }
 
 // 同一行的 4 个相邻输出总共只需要 6 个不同的输入位置。每个 3-tap
@@ -60,6 +86,7 @@ __device__ __forceinline__ void accumulateRowTile(
 // 一个 CTA 计算同一 batch、同一行的连续 4 个空间位置；一个线程负责
 // 一个 channel-pair。blockIdx 直接表达 column-tile/row/batch，因此热路径
 // 不再把线性线程编号除法、取模成 token、row 和 column。
+template <bool kUseFixed88Shape, bool kFuseGelu>
 __global__ void block1PackedDwconvHalf2Kernel(
     const __half2* __restrict__ input,
     const __half2* __restrict__ packedWeight,
@@ -69,6 +96,10 @@ __global__ void block1PackedDwconvHalf2Kernel(
     int32_t width,
     int32_t channelPairs
 ) {
+    const int32_t kernelHeight =
+        kUseFixed88Shape ? kFixedSpatialExtent : height;
+    const int32_t kernelWidth =
+        kUseFixed88Shape ? kFixedSpatialExtent : width;
     const int32_t channelPair = static_cast<int32_t>(threadIdx.x);
     const int32_t tileColumn =
         static_cast<int32_t>(blockIdx.x) * kOutputsPerTile;
@@ -82,7 +113,7 @@ __global__ void block1PackedDwconvHalf2Kernel(
     float2 accumulator3 = bias;
 
     const int64_t batchRowPairOffset =
-        (static_cast<int64_t>(batchIndex) * height + row) * width *
+        (static_cast<int64_t>(batchIndex) * kernelHeight + row) * kernelWidth *
         channelPairs;
     const int64_t tileOutputPairOffset =
         batchRowPairOffset +
@@ -91,15 +122,15 @@ __global__ void block1PackedDwconvHalf2Kernel(
     // 绝大多数 CTA 都在图像内部，走无边界判断的快速路径。每一行只加载
     // 6 个不同输入和 3 个权重，完成 4 个输出的 12 次 half2 卷积累加。
     const bool isInterior =
-        row > 0 && row + 1 < height && tileColumn > 0 &&
-        tileColumn + kOutputsPerTile < width;
+        row > 0 && row + 1 < kernelHeight && tileColumn > 0 &&
+        tileColumn + kOutputsPerTile < kernelWidth;
     if (isInterior) {
 #pragma unroll
         for (int32_t kernelRow = 0; kernelRow < 3; ++kernelRow) {
             const int32_t inputRow = row + kernelRow - 1;
             const int64_t inputRowPairOffset =
-                (static_cast<int64_t>(batchIndex) * height + inputRow) * width *
-                    channelPairs +
+                (static_cast<int64_t>(batchIndex) * kernelHeight + inputRow) *
+                    kernelWidth * channelPairs +
                 static_cast<int64_t>(tileColumn - 1) * channelPairs +
                 channelPair;
             const __half2* inputRowStart = input + inputRowPairOffset;
@@ -149,13 +180,13 @@ __global__ void block1PackedDwconvHalf2Kernel(
 #pragma unroll
         for (int32_t kernelRow = 0; kernelRow < 3; ++kernelRow) {
             const int32_t inputRow = row + kernelRow - 1;
-            if (inputRow < 0 || inputRow >= height) {
+            if (inputRow < 0 || inputRow >= kernelHeight) {
                 continue;
             }
 
             const int64_t inputRowPairOffset =
-                (static_cast<int64_t>(batchIndex) * height + inputRow) * width *
-                    channelPairs +
+                (static_cast<int64_t>(batchIndex) * kernelHeight + inputRow) *
+                    kernelWidth * channelPairs +
                 channelPair;
             const __half2* inputRowStart = input + inputRowPairOffset;
 
@@ -170,42 +201,91 @@ __global__ void block1PackedDwconvHalf2Kernel(
                 packedWeight + weightRowPairOffset + 2 * channelPairs
             );
 
-            const int32_t firstInputColumn = tileColumn - 1;
-            float2 input0 = zero;
-            float2 input1 = zero;
-            float2 input2 = zero;
-            float2 input3 = zero;
-            float2 input4 = zero;
-            float2 input5 = zero;
-            if (firstInputColumn >= 0 && firstInputColumn < width) {
-                input0 = loadHalf2AsFloat2(
-                    inputRowStart + firstInputColumn * channelPairs
-                );
-            }
-            if (firstInputColumn + 1 >= 0 && firstInputColumn + 1 < width) {
+            float2 input0;
+            float2 input1;
+            float2 input2;
+            float2 input3;
+            float2 input4;
+            float2 input5;
+            if constexpr (kUseFixed88Shape) {
+                // 88 可以被每个 CTA 的 4 个输出整除，因此中心 4 个输入必定
+                // 有效，只需分别处理左右两侧的 halo。
+                input0 = zero;
+                if (tileColumn > 0) {
+                    input0 = loadHalf2AsFloat2(
+                        inputRowStart +
+                        (tileColumn - 1) * channelPairs
+                    );
+                }
                 input1 = loadHalf2AsFloat2(
-                    inputRowStart + (firstInputColumn + 1) * channelPairs
+                    inputRowStart + tileColumn * channelPairs
                 );
-            }
-            if (firstInputColumn + 2 >= 0 && firstInputColumn + 2 < width) {
                 input2 = loadHalf2AsFloat2(
-                    inputRowStart + (firstInputColumn + 2) * channelPairs
+                    inputRowStart + (tileColumn + 1) * channelPairs
                 );
-            }
-            if (firstInputColumn + 3 >= 0 && firstInputColumn + 3 < width) {
                 input3 = loadHalf2AsFloat2(
-                    inputRowStart + (firstInputColumn + 3) * channelPairs
+                    inputRowStart + (tileColumn + 2) * channelPairs
                 );
-            }
-            if (firstInputColumn + 4 >= 0 && firstInputColumn + 4 < width) {
                 input4 = loadHalf2AsFloat2(
-                    inputRowStart + (firstInputColumn + 4) * channelPairs
+                    inputRowStart + (tileColumn + 3) * channelPairs
                 );
-            }
-            if (firstInputColumn + 5 >= 0 && firstInputColumn + 5 < width) {
-                input5 = loadHalf2AsFloat2(
-                    inputRowStart + (firstInputColumn + 5) * channelPairs
-                );
+                input5 = zero;
+                if (tileColumn + kOutputsPerTile < kFixedSpatialExtent) {
+                    input5 = loadHalf2AsFloat2(
+                        inputRowStart +
+                        (tileColumn + kOutputsPerTile) * channelPairs
+                    );
+                }
+            } else {
+                // 通用尺寸的最后一个 tile 可能不足 4 个输出，因此保留
+                // 所有逐列边界检查。
+                const int32_t firstInputColumn = tileColumn - 1;
+                input0 = zero;
+                input1 = zero;
+                input2 = zero;
+                input3 = zero;
+                input4 = zero;
+                input5 = zero;
+                if (firstInputColumn >= 0 && firstInputColumn < kernelWidth) {
+                    input0 = loadHalf2AsFloat2(
+                        inputRowStart + firstInputColumn * channelPairs
+                    );
+                }
+                if (firstInputColumn + 1 >= 0 &&
+                    firstInputColumn + 1 < kernelWidth) {
+                    input1 = loadHalf2AsFloat2(
+                        inputRowStart +
+                        (firstInputColumn + 1) * channelPairs
+                    );
+                }
+                if (firstInputColumn + 2 >= 0 &&
+                    firstInputColumn + 2 < kernelWidth) {
+                    input2 = loadHalf2AsFloat2(
+                        inputRowStart +
+                        (firstInputColumn + 2) * channelPairs
+                    );
+                }
+                if (firstInputColumn + 3 >= 0 &&
+                    firstInputColumn + 3 < kernelWidth) {
+                    input3 = loadHalf2AsFloat2(
+                        inputRowStart +
+                        (firstInputColumn + 3) * channelPairs
+                    );
+                }
+                if (firstInputColumn + 4 >= 0 &&
+                    firstInputColumn + 4 < kernelWidth) {
+                    input4 = loadHalf2AsFloat2(
+                        inputRowStart +
+                        (firstInputColumn + 4) * channelPairs
+                    );
+                }
+                if (firstInputColumn + 5 >= 0 &&
+                    firstInputColumn + 5 < kernelWidth) {
+                    input5 = loadHalf2AsFloat2(
+                        inputRowStart +
+                        (firstInputColumn + 5) * channelPairs
+                    );
+                }
             }
 
             accumulateRowTile(
@@ -226,21 +306,55 @@ __global__ void block1PackedDwconvHalf2Kernel(
         }
     }
 
-    // 这里只写回 DWConv FP16；exact erf-GELU 继续由 TensorRT/Myelin 处理。
-    output[tileOutputPairOffset] =
-        __floats2half2_rn(accumulator0.x, accumulator0.y);
-    if (tileColumn + 1 < width) {
+    // V11 仅写回 DWConv；V12 在同一 kernel 中执行 FastGELU，避免额外的
+    // Myelin kernel launch 和中间 FP16 张量往返。
+    output[tileOutputPairOffset] = convertOutput<kFuseGelu>(accumulator0);
+    if constexpr (kUseFixed88Shape) {
         output[tileOutputPairOffset + channelPairs] =
-            __floats2half2_rn(accumulator1.x, accumulator1.y);
-    }
-    if (tileColumn + 2 < width) {
+            convertOutput<kFuseGelu>(accumulator1);
         output[tileOutputPairOffset + 2 * channelPairs] =
-            __floats2half2_rn(accumulator2.x, accumulator2.y);
-    }
-    if (tileColumn + 3 < width) {
+            convertOutput<kFuseGelu>(accumulator2);
         output[tileOutputPairOffset + 3 * channelPairs] =
-            __floats2half2_rn(accumulator3.x, accumulator3.y);
+            convertOutput<kFuseGelu>(accumulator3);
+    } else {
+        if (tileColumn + 1 < kernelWidth) {
+            output[tileOutputPairOffset + channelPairs] =
+                convertOutput<kFuseGelu>(accumulator1);
+        }
+        if (tileColumn + 2 < kernelWidth) {
+            output[tileOutputPairOffset + 2 * channelPairs] =
+                convertOutput<kFuseGelu>(accumulator2);
+        }
+        if (tileColumn + 3 < kernelWidth) {
+            output[tileOutputPairOffset + 3 * channelPairs] =
+                convertOutput<kFuseGelu>(accumulator3);
+        }
     }
+}
+
+template <bool kUseFixed88Shape, bool kFuseGelu>
+void launchKernel(
+    const void* input,
+    const void* packedWeight,
+    const void* packedBias,
+    void* output,
+    const dim3& grid,
+    const dim3& block,
+    int32_t height,
+    int32_t width,
+    int32_t channelPairs,
+    cudaStream_t stream
+) noexcept {
+    block1PackedDwconvHalf2Kernel<kUseFixed88Shape, kFuseGelu>
+        <<<grid, block, 0, stream>>>(
+            static_cast<const __half2*>(input),
+            static_cast<const __half2*>(packedWeight),
+            static_cast<const __half2*>(packedBias),
+            static_cast<__half2*>(output),
+            height,
+            width,
+            channelPairs
+        );
 }
 
 } // 匿名命名空间
@@ -254,6 +368,7 @@ int32_t launchBlock1PackedDwconv(
     int32_t height,
     int32_t width,
     int32_t channels,
+    bool fuseGelu,
     cudaStream_t stream
 ) noexcept {
     if (input == nullptr || packedWeight == nullptr || packedBias == nullptr ||
@@ -274,15 +389,61 @@ int32_t launchBlock1PackedDwconv(
     );
     const dim3 block(static_cast<uint32_t>(channelPairs));
 
-    block1PackedDwconvHalf2Kernel<<<grid, block, 0, stream>>>(
-        static_cast<const __half2*>(input),
-        static_cast<const __half2*>(packedWeight),
-        static_cast<const __half2*>(packedBias),
-        static_cast<__half2*>(output),
-        height,
-        width,
-        channelPairs
-    );
+    const bool useFixed88Shape =
+        height == kFixedSpatialExtent && width == kFixedSpatialExtent;
+    if (useFixed88Shape && fuseGelu) {
+        launchKernel<true, true>(
+            input,
+            packedWeight,
+            packedBias,
+            output,
+            grid,
+            block,
+            height,
+            width,
+            channelPairs,
+            stream
+        );
+    } else if (useFixed88Shape) {
+        launchKernel<true, false>(
+            input,
+            packedWeight,
+            packedBias,
+            output,
+            grid,
+            block,
+            height,
+            width,
+            channelPairs,
+            stream
+        );
+    } else if (fuseGelu) {
+        launchKernel<false, true>(
+            input,
+            packedWeight,
+            packedBias,
+            output,
+            grid,
+            block,
+            height,
+            width,
+            channelPairs,
+            stream
+        );
+    } else {
+        launchKernel<false, false>(
+            input,
+            packedWeight,
+            packedBias,
+            output,
+            grid,
+            block,
+            height,
+            width,
+            channelPairs,
+            stream
+        );
+    }
     return cudaPeekAtLastError() == cudaSuccess ? 0 : -1;
 }
 

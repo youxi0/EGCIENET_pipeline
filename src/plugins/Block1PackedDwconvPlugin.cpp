@@ -115,14 +115,19 @@ Block1PackedDwconvPlugin::Block1PackedDwconvPlugin(
     int32_t height,
     int32_t width,
     int32_t channels,
+    int32_t fuseGelu,
     std::vector<int32_t> packedWeights,
     std::vector<int32_t> packedBias
 )
-    : height_(height), width_(width), channels_(channels) {
+    : height_(height),
+      width_(width),
+      channels_(channels),
+      fuseGelu_(fuseGelu) {
     if (height_ <= 0 || width_ <= 0 || channels_ <= 0 ||
-        (channels_ & 1) != 0) {
+        (channels_ & 1) != 0 || (fuseGelu_ != 0 && fuseGelu_ != 1)) {
         throw std::invalid_argument(
-            "packed DWConv requires positive H/W and an even channel count"
+            "packed DWConv requires positive H/W, an even channel count, "
+            "and fuse_gelu equal to 0 or 1"
         );
     }
 
@@ -154,12 +159,14 @@ Block1PackedDwconvPlugin::Block1PackedDwconvPlugin(
     int32_t height,
     int32_t width,
     int32_t channels,
+    int32_t fuseGelu,
     std::shared_ptr<const Block1PackedDwconvHostParameters> hostParameters,
     std::shared_ptr<const Block1PackedDwconvDeviceParameters> deviceParameters
 ) noexcept
     : height_(height),
       width_(width),
       channels_(channels),
+      fuseGelu_(fuseGelu),
       hostParameters_(std::move(hostParameters)),
       deviceParameters_(std::move(deviceParameters)) {}
 
@@ -184,6 +191,7 @@ nvinfer1::IPluginV3* Block1PackedDwconvPlugin::clone() noexcept {
         height_,
         width_,
         channels_,
+        fuseGelu_,
         hostParameters_,
         deviceParameters_
     );
@@ -360,6 +368,7 @@ int32_t Block1PackedDwconvPlugin::enqueue(
         height_,
         width_,
         channels_,
+        fuseGelu_ != 0,
         stream
     );
 }
@@ -386,6 +395,9 @@ Block1PackedDwconvPlugin::getFieldsToSerialize() noexcept {
         );
         serializedFields_.emplace_back(
             "channels", &channels_, nvinfer1::PluginFieldType::kINT32, 1
+        );
+        serializedFields_.emplace_back(
+            "fuse_gelu", &fuseGelu_, nvinfer1::PluginFieldType::kINT32, 1
         );
         serializedFields_.emplace_back(
             "packed_weights",
@@ -418,6 +430,9 @@ Block1PackedDwconvPluginCreator::Block1PackedDwconvPluginCreator() noexcept {
         );
         fields_.emplace_back(
             "channels", nullptr, nvinfer1::PluginFieldType::kINT32, 1
+        );
+        fields_.emplace_back(
+            "fuse_gelu", nullptr, nvinfer1::PluginFieldType::kINT32, 1
         );
         fields_.emplace_back(
             "packed_weights", nullptr, nvinfer1::PluginFieldType::kINT32, 0
@@ -475,6 +490,7 @@ nvinfer1::IPluginV3* Block1PackedDwconvPluginCreator::createPlugin(
         int32_t height = 0;
         int32_t width = 0;
         int32_t channels = 0;
+        int32_t fuseGelu = 0;
         std::vector<int32_t> packedWeights;
         std::vector<int32_t> packedBias;
 
@@ -496,6 +512,10 @@ nvinfer1::IPluginV3* Block1PackedDwconvPluginCreator::createPlugin(
                 if (!readScalarInt32(field, channels)) {
                     return nullptr;
                 }
+            } else if (fieldName == "fuse_gelu") {
+                if (!readScalarInt32(field, fuseGelu)) {
+                    return nullptr;
+                }
             } else if (fieldName == "packed_weights") {
                 if (!readPackedInt32Words(field, packedWeights)) {
                     return nullptr;
@@ -511,6 +531,7 @@ nvinfer1::IPluginV3* Block1PackedDwconvPluginCreator::createPlugin(
             height,
             width,
             channels,
+            fuseGelu,
             std::move(packedWeights),
             std::move(packedBias)
         );

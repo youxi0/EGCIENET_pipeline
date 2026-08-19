@@ -22,7 +22,8 @@ inline constexpr char kBlock1PackedDwconvPluginNamespace[] = "";
 struct Block1PackedDwconvHostParameters;
 struct Block1PackedDwconvDeviceParameters;
 
-// 单输入 IPluginV3：只计算 token-major DWConv，GELU 留给 TensorRT 原生图优化。
+// 单输入 IPluginV3：计算 token-major DWConv，并可按 ONNX 的 fuse_gelu 字段
+// 选择融合 FastGELU。V11 未提供该字段，默认保持仅 DWConv 的兼容行为。
 // 权重和 bias 已经由 ONNX 改图脚本按 half2 访问顺序打包，插件创建时一次性
 // 上传到设备；clone 和 execution context 只共享不可变参数，不再复制或重排。
 class Block1PackedDwconvPlugin final
@@ -35,6 +36,7 @@ public:
         int32_t height,
         int32_t width,
         int32_t channels,
+        int32_t fuseGelu,
         std::vector<int32_t> packedWeights,
         std::vector<int32_t> packedBias
     );
@@ -109,6 +111,7 @@ private:
         int32_t height,
         int32_t width,
         int32_t channels,
+        int32_t fuseGelu,
         std::shared_ptr<const Block1PackedDwconvHostParameters> hostParameters,
         std::shared_ptr<const Block1PackedDwconvDeviceParameters> deviceParameters
     ) noexcept;
@@ -123,6 +126,7 @@ private:
     int32_t height_ = 0;
     int32_t width_ = 0;
     int32_t channels_ = 0;
+    int32_t fuseGelu_ = 0;
     std::string namespace_ = kBlock1PackedDwconvPluginNamespace;
     std::shared_ptr<const Block1PackedDwconvHostParameters> hostParameters_;
     std::shared_ptr<const Block1PackedDwconvDeviceParameters> deviceParameters_;
