@@ -2,11 +2,12 @@
 
 set -Eeuo pipefail
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+source "${PROJECT_ROOT}/scripts/common/tensorrt_env.sh"
 
-ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v12_block1_packed_dwconv_gelu.engine}"
-PLUGIN_SO="${PLUGIN_SO:-${PROJECT_ROOT}/build/block1_packed_dwconv_plugin/lib/libegcinet_block1_packed_dwconv_plugin.so}"
+PLUGIN_BUILD_DIR="${PLUGIN_BUILD_DIR:-${PROJECT_ROOT}/build/packed_dwconv_plugin}"
+ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v15_block2_packed_dwconv_gelu.engine}"
+PLUGIN_SO="${PLUGIN_SO:-${PLUGIN_BUILD_DIR}/lib/libegcinet_packed_dwconv_plugin.so}"
 WARMUP_MS="${WARMUP_MS:-1000}"
 DURATION_SECONDS="${DURATION_SECONDS:-10}"
 ITERATIONS="${ITERATIONS:-10}"
@@ -26,7 +27,7 @@ fi
 configure_tensorrt_library_path
 mkdir -p "$(dirname "${PROFILE_JSON}")"
 
-echo "[INFO] benchmark V12 packed DWConv + FastGELU"
+echo "[INFO] benchmark V15 Block2 packed DWConv + GELU"
 "${TRTEXEC}" \
     "--loadEngine=${ENGINE}" \
     "--staticPlugins=${PLUGIN_SO}" \
@@ -35,6 +36,7 @@ echo "[INFO] benchmark V12 packed DWConv + FastGELU"
     "--warmUp=${WARMUP_MS}" \
     "--duration=${DURATION_SECONDS}" \
     "--iterations=${ITERATIONS}" \
+    --separateProfileRun \
     --profilingVerbosity=detailed \
     --dumpProfile \
     "--exportProfile=${PROFILE_JSON}"

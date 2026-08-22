@@ -11,8 +11,8 @@ set -Eeuo pipefail
 # trtexec invocation. This wrapper only composes layer precision constraints and
 # writes a separate engine by default.
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BASE_BUILDER="${PROJECT_ROOT}/scripts/build_int8_engine.sh"
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+BASE_BUILDER="${PROJECT_ROOT}/scripts/engine/build_int8_engine.sh"
 
 ONNX="${ONNX:-${PROJECT_ROOT}/models/egcienet_352_multiclass.onnx}"
 ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_hybrid_v1.engine}"

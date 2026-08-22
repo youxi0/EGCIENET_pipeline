@@ -2,8 +2,8 @@
 
 set -Eeuo pipefail
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+source "${PROJECT_ROOT}/scripts/common/tensorrt_env.sh"
 
 # 步骤 1：V10 使用已经插入插件节点的显式 Q/DQ ONNX，并保持独立输出文件名。
 ONNX="${ONNX:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v10_block1_fused.onnx}"
@@ -21,7 +21,7 @@ if [ ! -s "${ONNX}" ]; then
 fi
 if [ ! -s "${PLUGIN_SO}" ]; then
     echo "[ERROR] plugin library not found: ${PLUGIN_SO}" >&2
-    echo "[INFO] run: bash scripts/build_block1_fused_plugin.sh" >&2
+    echo "[INFO] run: bash scripts/plugins/build_block1_fused_plugin.sh" >&2
     exit 1
 fi
 

@@ -2,8 +2,8 @@
 
 set -Eeuo pipefail
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+source "${PROJECT_ROOT}/scripts/common/tensorrt_env.sh"
 
 # 步骤 1：固定 engine、插件和 benchmark 条件，环境变量可覆盖默认值。
 ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v10_block1_fused.engine}"

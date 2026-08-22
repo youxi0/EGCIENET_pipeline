@@ -2,13 +2,13 @@
 
 set -Eeuo pipefail
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+source "${PROJECT_ROOT}/scripts/common/tensorrt_env.sh"
 
 # 步骤 1：V11 ONNX 中只有 DWConv 由插件执行，GELU 仍是 TensorRT 原生子图。
 ONNX="${ONNX:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v11_block1_packed_dwconv.onnx}"
 ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v11_block1_packed_dwconv.engine}"
-PLUGIN_SO="${PLUGIN_SO:-${PROJECT_ROOT}/build/block1_packed_dwconv_plugin/lib/libegcinet_block1_packed_dwconv_plugin.so}"
+PLUGIN_SO="${PLUGIN_SO:-${PROJECT_ROOT}/build/packed_dwconv_plugin/lib/libegcinet_packed_dwconv_plugin.so}"
 WORKSPACE_MIB="${WORKSPACE_MIB:-2048}"
 LAYER_INFO="${LAYER_INFO:-${ENGINE%.engine}_layers.json}"
 
@@ -20,7 +20,7 @@ if [ ! -s "${ONNX}" ]; then
 fi
 if [ ! -s "${PLUGIN_SO}" ]; then
     echo "[ERROR] plugin library not found: ${PLUGIN_SO}" >&2
-    echo "[INFO] run: bash scripts/build_block1_packed_dwconv_plugin.sh" >&2
+    echo "[INFO] run: bash scripts/plugins/build_packed_dwconv_plugin.sh" >&2
     exit 1
 fi
 

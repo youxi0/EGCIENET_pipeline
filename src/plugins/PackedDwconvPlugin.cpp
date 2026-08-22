@@ -1,6 +1,4 @@
-#include "plugins/Block1PackedDwconvPlugin.h"
-
-#include "plugins/Block1PackedDwconvKernel.h"
+#include "plugins/PackedDwconvPlugin.h"
 
 #include <cuda_runtime_api.h>
 
@@ -12,16 +10,40 @@
 
 namespace egcinet::plugins {
 
-struct Block1PackedDwconvHostParameters {
+int32_t launchBlock1PackedDwconv(
+    const void* input,
+    const void* packedWeight,
+    const void* packedBias,
+    void* output,
+    cudaStream_t stream
+) noexcept;
+
+int32_t launchBlock2PackedDwconv(
+    const void* input,
+    const void* packedWeight,
+    const void* packedBias,
+    void* output,
+    cudaStream_t stream
+) noexcept;
+
+int32_t launchBlock3PackedDwconv(
+    const void* input,
+    const void* packedWeight,
+    const void* packedBias,
+    void* output,
+    cudaStream_t stream
+) noexcept;
+
+struct PackedDwconvHostParameters {
     std::vector<int32_t> packedWeights;
     std::vector<int32_t> packedBias;
 };
 
-struct Block1PackedDwconvDeviceParameters {
+struct PackedDwconvDeviceParameters {
     void* packedWeights = nullptr;
     void* packedBias = nullptr;
 
-    ~Block1PackedDwconvDeviceParameters() noexcept {
+    ~PackedDwconvDeviceParameters() noexcept {
         if (packedWeights != nullptr) {
             cudaFree(packedWeights);
         }
@@ -35,6 +57,32 @@ namespace {
 
 constexpr int32_t kSuccess = 0;
 constexpr int32_t kFailure = -1;
+constexpr int32_t kRequiredFuseGelu = 1;
+constexpr int32_t kBlock1Height = 88;
+constexpr int32_t kBlock1Width = 88;
+constexpr int32_t kBlock1Channels = 256;
+
+constexpr int32_t kBlock2Height = 44;
+constexpr int32_t kBlock2Width = 44;
+constexpr int32_t kBlock2Channels = 512;
+
+constexpr int32_t kBlock3Height = 22;
+constexpr int32_t kBlock3Width = 22;
+constexpr int32_t kBlock3Channels = 1280;
+
+bool isSupportedShape(
+    int32_t height,
+    int32_t width,
+    int32_t channels
+) noexcept {
+    return
+        (height == kBlock1Height && width == kBlock1Width &&
+         channels == kBlock1Channels) ||
+        (height == kBlock2Height && width == kBlock2Width &&
+         channels == kBlock2Channels) ||
+        (height == kBlock3Height && width == kBlock3Width &&
+         channels == kBlock3Channels);
+}
 
 bool isHalfLinear(const nvinfer1::PluginTensorDesc& descriptor) noexcept {
     return descriptor.type == nvinfer1::DataType::kHALF &&
@@ -111,23 +159,20 @@ void allocateAndCopy(void** destination, const std::vector<int32_t>& source) {
 
 } // namespace
 
-Block1PackedDwconvPlugin::Block1PackedDwconvPlugin(
+PackedDwconvPlugin::PackedDwconvPlugin(
     int32_t height,
     int32_t width,
     int32_t channels,
-    int32_t fuseGelu,
     std::vector<int32_t> packedWeights,
     std::vector<int32_t> packedBias
 )
     : height_(height),
       width_(width),
-      channels_(channels),
-      fuseGelu_(fuseGelu) {
-    if (height_ <= 0 || width_ <= 0 || channels_ <= 0 ||
-        (channels_ & 1) != 0 || (fuseGelu_ != 0 && fuseGelu_ != 1)) {
+      channels_(channels) {
+    if (!isSupportedShape(height_, width_, channels_)) {
         throw std::invalid_argument(
-            "packed DWConv requires positive H/W, an even channel count, "
-            "and fuse_gelu equal to 0 or 1"
+            "packed DWConv+GELU only supports 88x88x256, 44x44x512, "
+            "or 22x22x1280"
         );
     }
 
@@ -138,13 +183,13 @@ Block1PackedDwconvPlugin::Block1PackedDwconvPlugin(
     }
 
     // 步骤 1：保存序列化所需的 host 位模式。每个 int32_t 对应一个 half2。
-    auto hostParameters = std::make_shared<Block1PackedDwconvHostParameters>();
+    auto hostParameters = std::make_shared<PackedDwconvHostParameters>();
     hostParameters->packedWeights = std::move(packedWeights);
     hostParameters->packedBias = std::move(packedBias);
 
     // 步骤 2：Plugin 创建时一次性上传；enqueue 热路径只读取设备指针。
     auto deviceParameters =
-        std::make_shared<Block1PackedDwconvDeviceParameters>();
+        std::make_shared<PackedDwconvDeviceParameters>();
     allocateAndCopy(
         &deviceParameters->packedWeights,
         hostParameters->packedWeights
@@ -155,23 +200,21 @@ Block1PackedDwconvPlugin::Block1PackedDwconvPlugin(
     deviceParameters_ = std::move(deviceParameters);
 }
 
-Block1PackedDwconvPlugin::Block1PackedDwconvPlugin(
+PackedDwconvPlugin::PackedDwconvPlugin(
     int32_t height,
     int32_t width,
     int32_t channels,
-    int32_t fuseGelu,
-    std::shared_ptr<const Block1PackedDwconvHostParameters> hostParameters,
-    std::shared_ptr<const Block1PackedDwconvDeviceParameters> deviceParameters
+    std::shared_ptr<const PackedDwconvHostParameters> hostParameters,
+    std::shared_ptr<const PackedDwconvDeviceParameters> deviceParameters
 ) noexcept
     : height_(height),
       width_(width),
       channels_(channels),
-      fuseGelu_(fuseGelu),
       hostParameters_(std::move(hostParameters)),
       deviceParameters_(std::move(deviceParameters)) {}
 
 nvinfer1::IPluginCapability*
-Block1PackedDwconvPlugin::getCapabilityInterface(
+PackedDwconvPlugin::getCapabilityInterface(
     nvinfer1::PluginCapabilityType type
 ) noexcept {
     switch (type) {
@@ -186,12 +229,11 @@ Block1PackedDwconvPlugin::getCapabilityInterface(
     }
 }
 
-nvinfer1::IPluginV3* Block1PackedDwconvPlugin::clone() noexcept {
-    auto* plugin = new (std::nothrow) Block1PackedDwconvPlugin(
+nvinfer1::IPluginV3* PackedDwconvPlugin::clone() noexcept {
+    auto* plugin = new (std::nothrow) PackedDwconvPlugin(
         height_,
         width_,
         channels_,
-        fuseGelu_,
         hostParameters_,
         deviceParameters_
     );
@@ -201,19 +243,19 @@ nvinfer1::IPluginV3* Block1PackedDwconvPlugin::clone() noexcept {
     return plugin;
 }
 
-const char* Block1PackedDwconvPlugin::getPluginName() const noexcept {
-    return kBlock1PackedDwconvPluginName;
+const char* PackedDwconvPlugin::getPluginName() const noexcept {
+    return kPackedDwconvPluginName;
 }
 
-const char* Block1PackedDwconvPlugin::getPluginVersion() const noexcept {
-    return kBlock1PackedDwconvPluginVersion;
+const char* PackedDwconvPlugin::getPluginVersion() const noexcept {
+    return kPackedDwconvPluginVersion;
 }
 
-const char* Block1PackedDwconvPlugin::getPluginNamespace() const noexcept {
+const char* PackedDwconvPlugin::getPluginNamespace() const noexcept {
     return namespace_.c_str();
 }
 
-void Block1PackedDwconvPlugin::setPluginNamespace(
+void PackedDwconvPlugin::setPluginNamespace(
     const char* pluginNamespace
 ) noexcept {
     if (pluginNamespace == nullptr) {
@@ -225,11 +267,11 @@ void Block1PackedDwconvPlugin::setPluginNamespace(
     }
 }
 
-int32_t Block1PackedDwconvPlugin::getNbOutputs() const noexcept {
+int32_t PackedDwconvPlugin::getNbOutputs() const noexcept {
     return 1;
 }
 
-int32_t Block1PackedDwconvPlugin::getOutputDataTypes(
+int32_t PackedDwconvPlugin::getOutputDataTypes(
     nvinfer1::DataType* outputTypes,
     int32_t nbOutputs,
     const nvinfer1::DataType* inputTypes,
@@ -243,7 +285,7 @@ int32_t Block1PackedDwconvPlugin::getOutputDataTypes(
     return kSuccess;
 }
 
-int32_t Block1PackedDwconvPlugin::getOutputShapes(
+int32_t PackedDwconvPlugin::getOutputShapes(
     const nvinfer1::DimsExprs* inputs,
     int32_t nbInputs,
     const nvinfer1::DimsExprs* /* shapeInputs */,
@@ -260,7 +302,7 @@ int32_t Block1PackedDwconvPlugin::getOutputShapes(
     return kSuccess;
 }
 
-bool Block1PackedDwconvPlugin::supportsFormatCombination(
+bool PackedDwconvPlugin::supportsFormatCombination(
     int32_t pos,
     const nvinfer1::DynamicPluginTensorDesc* inOut,
     int32_t nbInputs,
@@ -273,7 +315,7 @@ bool Block1PackedDwconvPlugin::supportsFormatCombination(
     return isHalfLinear(inOut[pos].desc);
 }
 
-int32_t Block1PackedDwconvPlugin::configurePlugin(
+int32_t PackedDwconvPlugin::configurePlugin(
     const nvinfer1::DynamicPluginTensorDesc* inputs,
     int32_t nbInputs,
     const nvinfer1::DynamicPluginTensorDesc* outputs,
@@ -289,14 +331,16 @@ int32_t Block1PackedDwconvPlugin::configurePlugin(
 
     const int32_t tokens = inputs[0].desc.dims.d[1];
     const int32_t channels = inputs[0].desc.dims.d[2];
-    if ((tokens >= 0 && tokens != height_ * width_) ||
+    const int32_t batch = inputs[0].desc.dims.d[0];
+    if ((batch >= 0 && batch != 1) ||
+        (tokens >= 0 && tokens != height_ * width_) ||
         (channels >= 0 && channels != channels_)) {
         return kFailure;
     }
     return kSuccess;
 }
 
-bool Block1PackedDwconvPlugin::validateDescriptors(
+bool PackedDwconvPlugin::validateDescriptors(
     const nvinfer1::PluginTensorDesc* inputs,
     int32_t nbInputs,
     const nvinfer1::PluginTensorDesc* outputs,
@@ -312,7 +356,7 @@ bool Block1PackedDwconvPlugin::validateDescriptors(
     if (!isHalfLinear(inputs[0]) || !isHalfLinear(outputs[0])) {
         return false;
     }
-    if (inputs[0].dims.d[0] <= 0 ||
+    if (inputs[0].dims.d[0] != 1 ||
         inputs[0].dims.d[1] != height_ * width_ ||
         inputs[0].dims.d[2] != channels_) {
         return false;
@@ -325,7 +369,7 @@ bool Block1PackedDwconvPlugin::validateDescriptors(
     return true;
 }
 
-int32_t Block1PackedDwconvPlugin::onShapeChange(
+int32_t PackedDwconvPlugin::onShapeChange(
     const nvinfer1::PluginTensorDesc* inputs,
     int32_t nbInputs,
     const nvinfer1::PluginTensorDesc* outputs,
@@ -336,7 +380,7 @@ int32_t Block1PackedDwconvPlugin::onShapeChange(
         : kFailure;
 }
 
-size_t Block1PackedDwconvPlugin::getWorkspaceSize(
+size_t PackedDwconvPlugin::getWorkspaceSize(
     const nvinfer1::DynamicPluginTensorDesc* /* inputs */,
     int32_t /* nbInputs */,
     const nvinfer1::DynamicPluginTensorDesc* /* outputs */,
@@ -345,7 +389,7 @@ size_t Block1PackedDwconvPlugin::getWorkspaceSize(
     return 0;
 }
 
-int32_t Block1PackedDwconvPlugin::enqueue(
+int32_t PackedDwconvPlugin::enqueue(
     const nvinfer1::PluginTensorDesc* inputDesc,
     const nvinfer1::PluginTensorDesc* outputDesc,
     const void* const* inputs,
@@ -359,21 +403,37 @@ int32_t Block1PackedDwconvPlugin::enqueue(
         return kFailure;
     }
 
+    if (height_ == kBlock3Height && width_ == kBlock3Width &&
+        channels_ == kBlock3Channels) {
+        return launchBlock3PackedDwconv(
+            inputs[0],
+            deviceParameters_->packedWeights,
+            deviceParameters_->packedBias,
+            outputs[0],
+            stream
+        );
+    }
+    if (height_ == kBlock2Height && width_ == kBlock2Width &&
+        channels_ == kBlock2Channels) {
+        return launchBlock2PackedDwconv(
+            inputs[0],
+            deviceParameters_->packedWeights,
+            deviceParameters_->packedBias,
+            outputs[0],
+            stream
+        );
+    }
+
     return launchBlock1PackedDwconv(
         inputs[0],
         deviceParameters_->packedWeights,
         deviceParameters_->packedBias,
         outputs[0],
-        inputDesc[0].dims.d[0],
-        height_,
-        width_,
-        channels_,
-        fuseGelu_ != 0,
         stream
     );
 }
 
-nvinfer1::IPluginV3* Block1PackedDwconvPlugin::attachToContext(
+nvinfer1::IPluginV3* PackedDwconvPlugin::attachToContext(
     nvinfer1::IPluginResourceContext* /* context */
 ) noexcept {
     // 设备参数只读，所有 execution context 可以安全共享同一份缓冲。
@@ -381,7 +441,7 @@ nvinfer1::IPluginV3* Block1PackedDwconvPlugin::attachToContext(
 }
 
 const nvinfer1::PluginFieldCollection*
-Block1PackedDwconvPlugin::getFieldsToSerialize() noexcept {
+PackedDwconvPlugin::getFieldsToSerialize() noexcept {
     if (hostParameters_ == nullptr) {
         return nullptr;
     }
@@ -397,7 +457,10 @@ Block1PackedDwconvPlugin::getFieldsToSerialize() noexcept {
             "channels", &channels_, nvinfer1::PluginFieldType::kINT32, 1
         );
         serializedFields_.emplace_back(
-            "fuse_gelu", &fuseGelu_, nvinfer1::PluginFieldType::kINT32, 1
+            "fuse_gelu",
+            &kRequiredFuseGelu,
+            nvinfer1::PluginFieldType::kINT32,
+            1
         );
         serializedFields_.emplace_back(
             "packed_weights",
@@ -420,7 +483,7 @@ Block1PackedDwconvPlugin::getFieldsToSerialize() noexcept {
     }
 }
 
-Block1PackedDwconvPluginCreator::Block1PackedDwconvPluginCreator() noexcept {
+PackedDwconvPluginCreator::PackedDwconvPluginCreator() noexcept {
     try {
         fields_.emplace_back(
             "height", nullptr, nvinfer1::PluginFieldType::kINT32, 1
@@ -448,24 +511,24 @@ Block1PackedDwconvPluginCreator::Block1PackedDwconvPluginCreator() noexcept {
     }
 }
 
-const char* Block1PackedDwconvPluginCreator::getPluginName() const noexcept {
-    return kBlock1PackedDwconvPluginName;
+const char* PackedDwconvPluginCreator::getPluginName() const noexcept {
+    return kPackedDwconvPluginName;
 }
 
-const char* Block1PackedDwconvPluginCreator::getPluginVersion() const noexcept {
-    return kBlock1PackedDwconvPluginVersion;
+const char* PackedDwconvPluginCreator::getPluginVersion() const noexcept {
+    return kPackedDwconvPluginVersion;
 }
 
 const nvinfer1::PluginFieldCollection*
-Block1PackedDwconvPluginCreator::getFieldNames() noexcept {
+PackedDwconvPluginCreator::getFieldNames() noexcept {
     return &fieldCollection_;
 }
 
-const char* Block1PackedDwconvPluginCreator::getPluginNamespace() const noexcept {
+const char* PackedDwconvPluginCreator::getPluginNamespace() const noexcept {
     return namespace_.c_str();
 }
 
-void Block1PackedDwconvPluginCreator::setPluginNamespace(
+void PackedDwconvPluginCreator::setPluginNamespace(
     const char* pluginNamespace
 ) noexcept {
     if (pluginNamespace == nullptr) {
@@ -477,7 +540,7 @@ void Block1PackedDwconvPluginCreator::setPluginNamespace(
     }
 }
 
-nvinfer1::IPluginV3* Block1PackedDwconvPluginCreator::createPlugin(
+nvinfer1::IPluginV3* PackedDwconvPluginCreator::createPlugin(
     const char* /* name */,
     const nvinfer1::PluginFieldCollection* fieldCollection,
     nvinfer1::TensorRTPhase /* phase */
@@ -527,11 +590,16 @@ nvinfer1::IPluginV3* Block1PackedDwconvPluginCreator::createPlugin(
             }
         }
 
-        auto* plugin = new Block1PackedDwconvPlugin(
+        // 只接受最终的 V12/V14 融合图，避免旧 V11/V13 engine 使用新库后
+        // 静默得到错误结果。
+        if (fuseGelu != kRequiredFuseGelu) {
+            return nullptr;
+        }
+
+        auto* plugin = new PackedDwconvPlugin(
             height,
             width,
             channels,
-            fuseGelu,
             std::move(packedWeights),
             std::move(packedBias)
         );
@@ -542,6 +610,6 @@ nvinfer1::IPluginV3* Block1PackedDwconvPluginCreator::createPlugin(
     }
 }
 
-REGISTER_TENSORRT_PLUGIN(Block1PackedDwconvPluginCreator);
+REGISTER_TENSORRT_PLUGIN(PackedDwconvPluginCreator);
 
 } // 命名空间 egcinet::plugins

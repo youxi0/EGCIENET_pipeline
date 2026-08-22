@@ -14,8 +14,8 @@ option(
     ON
 )
 option(
-    EGCINET_BUILD_BLOCK1_PACKED_DWCONV_PLUGIN
-    "Build the block1 packed-weight DWConv TensorRT plugin"
+    EGCINET_BUILD_PACKED_DWCONV_PLUGIN
+    "Build the packed-weight DWConv + GELU TensorRT plugin"
     OFF
 )
 
@@ -155,36 +155,39 @@ endif()
 
 # Pipeline 和自定义插件都包含 .cu 文件，仅在确实需要时启用 CUDA 语言。
 if(EGCINET_BUILD_PIPELINE OR EGCINET_BUILD_BLOCK1_FUSED_PLUGIN OR
-   EGCINET_BUILD_BLOCK1_PACKED_DWCONV_PLUGIN)
+   EGCINET_BUILD_PACKED_DWCONV_PLUGIN)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
-# V11/V12 插件只接收激活；half2 权重和 bias 作为序列化字段由插件持有。
-# V12 通过可选 fuse_gelu 字段在同一个 CUDA kernel 中追加 FastGELU。
-if(EGCINET_BUILD_BLOCK1_PACKED_DWCONV_PLUGIN)
-    add_library(egcinet_block1_packed_dwconv_plugin SHARED
+# 最终 V14 插件只接收激活；half2 权重和 bias 作为序列化字段由插件持有。
+# Block1/2/3 kernel 都固定融合 half2 tanh GELU；TensorRT plugin 按算子
+# 统一管理，CUDA kernel 则按具体形状和 channel 分块策略拆分。
+if(EGCINET_BUILD_PACKED_DWCONV_PLUGIN)
+    add_library(egcinet_packed_dwconv_plugin SHARED
         src/plugins/Block1PackedDwconvKernel.cu
-        src/plugins/Block1PackedDwconvPlugin.cpp
+        src/plugins/Block2PackedDwconvKernel.cu
+        src/plugins/Block3PackedDwconvKernel.cu
+        src/plugins/PackedDwconvPlugin.cpp
     )
 
-    target_include_directories(egcinet_block1_packed_dwconv_plugin PRIVATE
+    target_include_directories(egcinet_packed_dwconv_plugin PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${TENSORRT_INCLUDE_DIR}
     )
 
-    target_link_libraries(egcinet_block1_packed_dwconv_plugin PRIVATE
+    target_link_libraries(egcinet_packed_dwconv_plugin PRIVATE
         ${TENSORRT_NVINFER_LIB}
         CUDA::cudart
     )
 
-    set_target_properties(egcinet_block1_packed_dwconv_plugin PROPERTIES
+    set_target_properties(egcinet_packed_dwconv_plugin PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
         POSITION_INDEPENDENT_CODE ON
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
-        OUTPUT_NAME egcinet_block1_packed_dwconv_plugin
+        OUTPUT_NAME egcinet_packed_dwconv_plugin
     )
 endif()
 

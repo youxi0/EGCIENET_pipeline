@@ -2,8 +2,8 @@
 
 set -Eeuo pipefail
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+source "${PROJECT_ROOT}/scripts/common/tensorrt_env.sh"
 
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
 CALIBRATOR="${CALIBRATOR:-${BUILD_DIR}/bin/egcinet_calibrate_int8}"
@@ -22,7 +22,7 @@ WORKSPACE_MIB="${WORKSPACE_MIB:-2048}"
 
 if [ ! -x "${CALIBRATOR}" ]; then
     echo "[ERROR] INT8 calibrator not found: ${CALIBRATOR}" >&2
-    echo "[INFO] run: bash scripts/build.sh" >&2
+    echo "[INFO] run: bash scripts/pipeline/build.sh" >&2
     exit 1
 fi
 if [ ! -s "${ONNX}" ]; then

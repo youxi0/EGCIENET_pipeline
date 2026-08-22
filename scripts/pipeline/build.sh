@@ -2,15 +2,15 @@
 
 set -Eeuo pipefail
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+source "${PROJECT_ROOT}/scripts/common/tensorrt_env.sh"
 
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 BUILD_PIPELINE="${BUILD_PIPELINE:-ON}"
 BUILD_INT8_CALIBRATOR="${BUILD_INT8_CALIBRATOR:-OFF}"
 BUILD_BLOCK1_FUSED_PLUGIN="${BUILD_BLOCK1_FUSED_PLUGIN:-ON}"
-BUILD_BLOCK1_PACKED_DWCONV_PLUGIN="${BUILD_BLOCK1_PACKED_DWCONV_PLUGIN:-ON}"
+BUILD_PACKED_DWCONV_PLUGIN="${BUILD_PACKED_DWCONV_PLUGIN:-ON}"
 CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES:-87}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
@@ -29,7 +29,7 @@ validate_switch() {
 validate_switch BUILD_PIPELINE "${BUILD_PIPELINE}"
 validate_switch BUILD_INT8_CALIBRATOR "${BUILD_INT8_CALIBRATOR}"
 validate_switch BUILD_BLOCK1_FUSED_PLUGIN "${BUILD_BLOCK1_FUSED_PLUGIN}"
-validate_switch BUILD_BLOCK1_PACKED_DWCONV_PLUGIN "${BUILD_BLOCK1_PACKED_DWCONV_PLUGIN}"
+validate_switch BUILD_PACKED_DWCONV_PLUGIN "${BUILD_PACKED_DWCONV_PLUGIN}"
 
 echo "[INFO] project root:         ${PROJECT_ROOT}"
 echo "[INFO] build dir:            ${BUILD_DIR}"
@@ -39,7 +39,7 @@ echo "[INFO] jobs:                 ${JOBS}"
 echo "[INFO] pipeline:             ${BUILD_PIPELINE}"
 echo "[INFO] INT8 calibrator:      ${BUILD_INT8_CALIBRATOR}"
 echo "[INFO] Block1 fused plugin:  ${BUILD_BLOCK1_FUSED_PLUGIN}"
-echo "[INFO] packed DWConv plugin: ${BUILD_BLOCK1_PACKED_DWCONV_PLUGIN}"
+echo "[INFO] packed DWConv plugin: ${BUILD_PACKED_DWCONV_PLUGIN}"
 
 configure_tensorrt_library_path
 
@@ -51,7 +51,7 @@ CMAKE_ARGS=(
     "-DEGCINET_BUILD_PIPELINE=${BUILD_PIPELINE}"
     "-DEGCINET_BUILD_INT8_CALIBRATOR=${BUILD_INT8_CALIBRATOR}"
     "-DEGCINET_BUILD_BLOCK1_FUSED_PLUGIN=${BUILD_BLOCK1_FUSED_PLUGIN}"
-    "-DEGCINET_BUILD_BLOCK1_PACKED_DWCONV_PLUGIN=${BUILD_BLOCK1_PACKED_DWCONV_PLUGIN}"
+    "-DEGCINET_BUILD_PACKED_DWCONV_PLUGIN=${BUILD_PACKED_DWCONV_PLUGIN}"
 )
 
 if [ -n "${TENSORRT_ROOT:-}" ]; then
@@ -87,13 +87,13 @@ if [ "${BUILD_BLOCK1_FUSED_PLUGIN}" = "ON" ]; then
     require_output "${BUILD_DIR}/lib/libegcinet_block1_fused_plugin.so"
 fi
 
-if [ "${BUILD_BLOCK1_PACKED_DWCONV_PLUGIN}" = "ON" ]; then
-    require_output "${BUILD_DIR}/lib/libegcinet_block1_packed_dwconv_plugin.so"
+if [ "${BUILD_PACKED_DWCONV_PLUGIN}" = "ON" ]; then
+    require_output "${BUILD_DIR}/lib/libegcinet_packed_dwconv_plugin.so"
 fi
 
 echo "[PASS] full build finished"
 
-if [ "${BUILD_BLOCK1_PACKED_DWCONV_PLUGIN}" = "ON" ]; then
-    echo "[INFO] load the v12 plugin with:"
-    echo "       export EGCINET_TRT_PLUGIN_LIBS=${BUILD_DIR}/lib/libegcinet_block1_packed_dwconv_plugin.so"
+if [ "${BUILD_PACKED_DWCONV_PLUGIN}" = "ON" ]; then
+    echo "[INFO] load the fused packed DWConv plugin with:"
+    echo "       export EGCINET_TRT_PLUGIN_LIBS=${BUILD_DIR}/lib/libegcinet_packed_dwconv_plugin.so"
 fi

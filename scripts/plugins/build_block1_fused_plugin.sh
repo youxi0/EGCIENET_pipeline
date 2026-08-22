@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 
 # 步骤 1：集中定义构建目录、Orin 架构和并行度，允许环境变量覆盖。
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build/block1_fused_plugin}"

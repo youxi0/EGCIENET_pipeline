@@ -4,7 +4,7 @@
 #include <NvInferVersion.h>
 
 #if NV_TENSORRT_MAJOR < 10
-#error "Block1PackedDwconvPlugin requires TensorRT 10 or newer."
+#error "PackedDwconvPlugin requires TensorRT 10 or newer."
 #endif
 
 #include <cstdint>
@@ -14,33 +14,36 @@
 
 namespace egcinet::plugins {
 
-inline constexpr char kBlock1PackedDwconvPluginName[] =
+// 现有 v12/v14 ONNX 和 engine 使用该 creator 名；类和文件已经按算子命名，
+// creator 字符串需等重新导出模型后再单独升级版本。
+inline constexpr char kPackedDwconvPluginName[] =
     "EGCINET_Block1PackedDwconv";
-inline constexpr char kBlock1PackedDwconvPluginVersion[] = "1";
-inline constexpr char kBlock1PackedDwconvPluginNamespace[] = "";
+inline constexpr char kPackedDwconvPluginVersion[] = "1";
+inline constexpr char kPackedDwconvPluginNamespace[] = "";
 
-struct Block1PackedDwconvHostParameters;
-struct Block1PackedDwconvDeviceParameters;
+struct PackedDwconvHostParameters;
+struct PackedDwconvDeviceParameters;
 
-// 单输入 IPluginV3：计算 token-major DWConv，并可按 ONNX 的 fuse_gelu 字段
-// 选择融合 FastGELU。V11 未提供该字段，默认保持仅 DWConv 的兼容行为。
+// 单输入 IPluginV3：计算 token-major Packed DWConv，并固定融合 half2 tanh
+// GELU。TensorRT 生命周期和序列化由这里统一管理，Block1/2/3 的支持形状
+// 分别派发到独立的 CUDA kernel 文件。
+// fuse_gelu 字段仅为 V14 engine 的序列化兼容保留，并且必须等于 1。
 // 权重和 bias 已经由 ONNX 改图脚本按 half2 访问顺序打包，插件创建时一次性
 // 上传到设备；clone 和 execution context 只共享不可变参数，不再复制或重排。
-class Block1PackedDwconvPlugin final
+class PackedDwconvPlugin final
     : public nvinfer1::IPluginV3,
       public nvinfer1::IPluginV3OneCore,
       public nvinfer1::IPluginV3OneBuild,
       public nvinfer1::IPluginV3OneRuntime {
 public:
-    Block1PackedDwconvPlugin(
+    PackedDwconvPlugin(
         int32_t height,
         int32_t width,
         int32_t channels,
-        int32_t fuseGelu,
         std::vector<int32_t> packedWeights,
         std::vector<int32_t> packedBias
     );
-    ~Block1PackedDwconvPlugin() noexcept override = default;
+    ~PackedDwconvPlugin() noexcept override = default;
 
     nvinfer1::IPluginCapability* getCapabilityInterface(
         nvinfer1::PluginCapabilityType type
@@ -107,13 +110,12 @@ public:
 
 private:
     // 接收两个 shared_ptr，用于 clone() 直接共享已经上传的不可变参数
-    Block1PackedDwconvPlugin(
+    PackedDwconvPlugin(
         int32_t height,
         int32_t width,
         int32_t channels,
-        int32_t fuseGelu,
-        std::shared_ptr<const Block1PackedDwconvHostParameters> hostParameters,
-        std::shared_ptr<const Block1PackedDwconvDeviceParameters> deviceParameters
+        std::shared_ptr<const PackedDwconvHostParameters> hostParameters,
+        std::shared_ptr<const PackedDwconvDeviceParameters> deviceParameters
     ) noexcept;
 
     bool validateDescriptors(
@@ -126,19 +128,18 @@ private:
     int32_t height_ = 0;
     int32_t width_ = 0;
     int32_t channels_ = 0;
-    int32_t fuseGelu_ = 0;
-    std::string namespace_ = kBlock1PackedDwconvPluginNamespace;
-    std::shared_ptr<const Block1PackedDwconvHostParameters> hostParameters_;
-    std::shared_ptr<const Block1PackedDwconvDeviceParameters> deviceParameters_;
+    std::string namespace_ = kPackedDwconvPluginNamespace;
+    std::shared_ptr<const PackedDwconvHostParameters> hostParameters_;
+    std::shared_ptr<const PackedDwconvDeviceParameters> deviceParameters_;
     std::vector<nvinfer1::PluginField> serializedFields_;
     nvinfer1::PluginFieldCollection serializedFieldCollection_{};
 };
 
-class Block1PackedDwconvPluginCreator final
+class PackedDwconvPluginCreator final
     : public nvinfer1::IPluginCreatorV3One {
 public:
-    Block1PackedDwconvPluginCreator() noexcept;
-    ~Block1PackedDwconvPluginCreator() noexcept override = default;
+    PackedDwconvPluginCreator() noexcept;
+    ~PackedDwconvPluginCreator() noexcept override = default;
 
     const char* getPluginName() const noexcept override;
     const char* getPluginVersion() const noexcept override;
@@ -152,7 +153,7 @@ public:
     ) noexcept override;
 
 private:
-    std::string namespace_ = kBlock1PackedDwconvPluginNamespace;
+    std::string namespace_ = kPackedDwconvPluginNamespace;
     std::vector<nvinfer1::PluginField> fields_;
     nvinfer1::PluginFieldCollection fieldCollection_{};
 };

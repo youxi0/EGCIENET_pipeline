@@ -2,11 +2,12 @@
 
 set -Eeuo pipefail
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+source "${PROJECT_ROOT}/scripts/common/tensorrt_env.sh"
 
-ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v11_block1_packed_dwconv.engine}"
-PLUGIN_SO="${PLUGIN_SO:-${PROJECT_ROOT}/build/block1_packed_dwconv_plugin/lib/libegcinet_block1_packed_dwconv_plugin.so}"
+BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
+ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v13_block3_packed_dwconv.engine}"
+PLUGIN_SO="${PLUGIN_SO:-${BUILD_DIR}/lib/libegcinet_packed_dwconv_plugin.so}"
 WARMUP_MS="${WARMUP_MS:-1000}"
 DURATION_SECONDS="${DURATION_SECONDS:-10}"
 ITERATIONS="${ITERATIONS:-10}"
@@ -26,8 +27,7 @@ fi
 configure_tensorrt_library_path
 mkdir -p "$(dirname "${PROFILE_JSON}")"
 
-# 与 V7/V10 保持相同条件，重点比较三个 PackedDwconv 层及 TensorRT GELU 层。
-echo "[INFO] benchmark V11 packed DWConv with native TensorRT GELU"
+echo "[INFO] benchmark V13 Block3 packed DWConv"
 "${TRTEXEC}" \
     "--loadEngine=${ENGINE}" \
     "--staticPlugins=${PLUGIN_SO}" \
@@ -36,6 +36,7 @@ echo "[INFO] benchmark V11 packed DWConv with native TensorRT GELU"
     "--warmUp=${WARMUP_MS}" \
     "--duration=${DURATION_SECONDS}" \
     "--iterations=${ITERATIONS}" \
+    --separateProfileRun \
     --profilingVerbosity=detailed \
     --dumpProfile \
     "--exportProfile=${PROFILE_JSON}"

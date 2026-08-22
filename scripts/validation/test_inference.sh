@@ -2,8 +2,8 @@
 
 set -Eeuo pipefail
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-source "${PROJECT_ROOT}/scripts/tensorrt_env.sh"
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+source "${PROJECT_ROOT}/scripts/common/tensorrt_env.sh"
 
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build-debug}"
 RESULT_DIR="${RESULT_DIR:-${PROJECT_ROOT}/results/debug_inference}"
@@ -63,9 +63,9 @@ run_sanitizer() {
 
 if [ -z "${IMAGE}" ]; then
     echo "Usage:" >&2
-    echo "  bash scripts/test_inference.sh <image>" >&2
-    echo "  bash scripts/test_inference.sh <engine> <image>" >&2
-    echo "  IMAGE=/path/test.jpg ENGINE=/path/model.engine bash scripts/test_inference.sh" >&2
+    echo "  bash scripts/validation/test_inference.sh <image>" >&2
+    echo "  bash scripts/validation/test_inference.sh <engine> <image>" >&2
+    echo "  IMAGE=/path/test.jpg ENGINE=/path/model.engine bash scripts/validation/test_inference.sh" >&2
     exit 1
 fi
 
