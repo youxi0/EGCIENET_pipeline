@@ -34,6 +34,14 @@ int32_t launchBlock3PackedDwconv(
     cudaStream_t stream
 ) noexcept;
 
+int32_t launchBlock4PackedDwconv(
+    const void* input,
+    const void* packedWeight,
+    const void* packedBias,
+    void* output,
+    cudaStream_t stream
+) noexcept;
+
 struct PackedDwconvHostParameters {
     std::vector<int32_t> packedWeights;
     std::vector<int32_t> packedBias;
@@ -70,6 +78,10 @@ constexpr int32_t kBlock3Height = 22;
 constexpr int32_t kBlock3Width = 22;
 constexpr int32_t kBlock3Channels = 1280;
 
+constexpr int32_t kBlock4Height = 11;
+constexpr int32_t kBlock4Width = 11;
+constexpr int32_t kBlock4Channels = 2048;
+
 bool isSupportedShape(
     int32_t height,
     int32_t width,
@@ -81,7 +93,9 @@ bool isSupportedShape(
         (height == kBlock2Height && width == kBlock2Width &&
          channels == kBlock2Channels) ||
         (height == kBlock3Height && width == kBlock3Width &&
-         channels == kBlock3Channels);
+         channels == kBlock3Channels) ||
+        (height == kBlock4Height && width == kBlock4Width &&
+         channels == kBlock4Channels);
 }
 
 bool isHalfLinear(const nvinfer1::PluginTensorDesc& descriptor) noexcept {
@@ -172,10 +186,9 @@ PackedDwconvPlugin::PackedDwconvPlugin(
     if (!isSupportedShape(height_, width_, channels_)) {
         throw std::invalid_argument(
             "packed DWConv+GELU only supports 88x88x256, 44x44x512, "
-            "or 22x22x1280"
+            "22x22x1280, or 11x11x2048"
         );
     }
-
     const size_t channelPairs = static_cast<size_t>(channels_ / 2);
     if (packedWeights.size() != 9U * channelPairs ||
         packedBias.size() != channelPairs) {
@@ -403,6 +416,16 @@ int32_t PackedDwconvPlugin::enqueue(
         return kFailure;
     }
 
+    if (height_ == kBlock4Height && width_ == kBlock4Width &&
+        channels_ == kBlock4Channels) {
+        return launchBlock4PackedDwconv(
+            inputs[0],
+            deviceParameters_->packedWeights,
+            deviceParameters_->packedBias,
+            outputs[0],
+            stream
+        );
+    }
     if (height_ == kBlock3Height && width_ == kBlock3Width &&
         channels_ == kBlock3Channels) {
         return launchBlock3PackedDwconv(

@@ -15,7 +15,7 @@
 ```bash
 bash scripts/pipeline/build.sh
 bash scripts/plugins/build_packed_dwconv_plugin.sh
-bash scripts/engine/build_v15_block2_packed_dwconv_gelu_engine.sh
-bash scripts/profiling/benchmark_v15_block2_packed_dwconv_gelu_engine.sh
+bash scripts/engine/build_v16_block4_packed_dwconv_gelu_engine.sh
+bash scripts/profiling/benchmark_v16_block4_packed_dwconv_gelu_engine.sh
 bash scripts/pipeline/run_server.sh
 ```

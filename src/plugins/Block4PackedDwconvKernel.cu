@@ -8,10 +8,16 @@ namespace {
 
 constexpr int32_t kOutputsPerTile = 4;
 constexpr int32_t kOutputRowsPerTile = 2;
-constexpr int32_t kFixedSpatialExtent = 88;
-constexpr int32_t kFixedChannelPairs = 128; // 256channels / 2
+constexpr int32_t kSpatialExtent = 11;
+constexpr int32_t kChannelPairs = 1024; // 2048 channels / 2
+constexpr int32_t kChannelPairsPerBlock = 128;
+constexpr int32_t kChannelTiles =
+    kChannelPairs / kChannelPairsPerBlock;
 constexpr float kGeluScale = 0.7978845608028654F;
-constexpr float kGeluScaledCubic = 0.035677406936883926F; // scale * 0.044715 常量折叠
+constexpr float kGeluScaledCubic =
+    0.035677406936883926F; // scale * 0.044715 常量折叠
+
+static_assert(kChannelPairs % kChannelPairsPerBlock == 0);
 
 __device__ __forceinline__ float2 loadHalf2AsFloat2(const __half2* address) {
     return __half22float2(*address);
@@ -26,8 +32,6 @@ __device__ __forceinline__ void multiplyAddHalf2(
     accumulator.y = fmaf(input.y, weight.y, accumulator.y);
 }
 
-// 卷积和 GELU 多项式保持 FP32；仅把两个 tanh 输入打包为 half2，使用
-// SM75+ 的 tanh.approx.f16x2 一次处理两个 channel，替代两条标量 MUFU。
 __device__ __forceinline__ __half2 convertOutput(const float2& accumulator) {
     const float xSquared0 = accumulator.x * accumulator.x;
     const float xSquared1 = accumulator.y * accumulator.y;
@@ -47,8 +51,50 @@ __device__ __forceinline__ __half2 convertOutput(const float2& accumulator) {
     );
 }
 
-// 同一行的 4 个相邻输出总共只需要 6 个不同的输入位置。每个 3-tap
-// 权重加载、转换一次后，分别复用到 4 个输出上。
+__device__ __forceinline__ void loadWeightRow(
+    const __half2* packedWeight,
+    int32_t kernelRow,
+    int32_t channelPair,
+    float2 (&weight)[3]
+) {
+    const int32_t rowOffset =
+        kernelRow * 3 * kChannelPairs + channelPair;
+#pragma unroll
+    for (int32_t kernelColumn = 0; kernelColumn < 3; ++kernelColumn) {
+        weight[kernelColumn] = loadHalf2AsFloat2(
+            packedWeight + rowOffset + kernelColumn * kChannelPairs
+        );
+    }
+}
+
+__device__ __forceinline__ void loadInteriorInputRow(
+    const __half2* inputRowStart,
+    float2 (&inputTile)[6]
+) {
+#pragma unroll
+    for (int32_t inputColumn = 0; inputColumn < 6; ++inputColumn) {
+        inputTile[inputColumn] = loadHalf2AsFloat2(
+            inputRowStart + inputColumn * kChannelPairs
+        );
+    }
+}
+
+__device__ __forceinline__ float2 loadBoundaryInput(
+    const __half2* inputRowStart,
+    int32_t column,
+    int32_t channelPair
+) {
+    if (column < 0 || column >= kSpatialExtent) {
+        return make_float2(0.0F, 0.0F);
+    }
+    return loadHalf2AsFloat2(
+        inputRowStart +
+        static_cast<int64_t>(column) * kChannelPairs + channelPair
+    );
+}
+
+// 4 个相邻输出复用六个输入与同一组 3-tap 权重。循环长度全部
+// 固定，nvcc 展开后与手写累加序列等价，同时保持边界和内部路径一致。
 __device__ __forceinline__ void accumulateRowTile(
     float2 (&accumulator)[kOutputsPerTile],
     const float2 (&inputTile)[6],
@@ -69,81 +115,28 @@ __device__ __forceinline__ void accumulateRowTile(
     }
 }
 
-__device__ __forceinline__ void loadWeightRow(
-    const __half2* packedWeight,
-    int32_t kernelRow,
-    int32_t channelPair,
-    int32_t channelPairs,
-    float2 (&weight)[3]
-) {
-    const int32_t rowOffset = kernelRow * 3 * channelPairs + channelPair;
-#pragma unroll
-    for (int32_t kernelColumn = 0; kernelColumn < 3; ++kernelColumn) {
-        weight[kernelColumn] = loadHalf2AsFloat2(
-            packedWeight + rowOffset + kernelColumn * channelPairs
-        );
-    }
-}
-
-__device__ __forceinline__ void loadInteriorInputRow(
-    const __half2* inputRowStart,
-    float2 (&inputTile)[6]
-) {
-#pragma unroll
-    for (int32_t inputColumn = 0; inputColumn < 6; ++inputColumn) {
-        inputTile[inputColumn] = loadHalf2AsFloat2(
-            inputRowStart + inputColumn * kFixedChannelPairs
-        );
-    }
-}
-
-__device__ __forceinline__ float2 loadBoundaryInput(
-    const __half2* inputRowStart,
-    int32_t column,
-    int32_t channelPair
-) {
-    if (column < 0 || column >= kFixedSpatialExtent) {
-        return make_float2(0.0F, 0.0F);
-    }
-    return loadHalf2AsFloat2(
-        inputRowStart +
-        static_cast<int64_t>(column) * kFixedChannelPairs + channelPair
-    );
-}
-
-// 固定 88x88 的边界 tile 数量很少，使用完整 padding 逻辑保证首尾行列
-// 正确；内部 tile 则由下面的 4x2 专用 kernel 走无分支快速路径。
 __device__ __forceinline__ void accumulateBoundaryRow(
     const __half2* input,
     const __half2* packedWeight,
     int32_t outputRow,
     int32_t tileColumn,
     int32_t channelPair,
-    int32_t channelPairs,
     float2 (&accumulator)[kOutputsPerTile]
 ) {
 #pragma unroll
     for (int32_t kernelRow = 0; kernelRow < 3; ++kernelRow) {
         const int32_t inputRow = outputRow + kernelRow - 1;
-        if (inputRow < 0 || inputRow >= kFixedSpatialExtent) {
+        if (inputRow < 0 || inputRow >= kSpatialExtent) {
             continue;
         }
 
         const int64_t rowOffset =
-            static_cast<int64_t>(inputRow) * kFixedSpatialExtent *
-            channelPairs;
+            static_cast<int64_t>(inputRow) * kSpatialExtent * kChannelPairs;
         const __half2* inputRowStart = input + rowOffset;
-
         float2 weight[3];
-        loadWeightRow(
-            packedWeight,
-            kernelRow,
-            channelPair,
-            channelPairs,
-            weight
-        );
-
         float2 inputTile[6];
+        loadWeightRow(packedWeight, kernelRow, channelPair, weight);
+
         const int32_t firstInputColumn = tileColumn - 1;
 #pragma unroll
         for (int32_t inputColumn = 0; inputColumn < 6; ++inputColumn) {
@@ -157,50 +150,46 @@ __device__ __forceinline__ void accumulateBoundaryRow(
     }
 }
 
-// 固定 88x88 热路径采用 4x2 二维 tile。相邻两个输出行共同需要 4 行
-// 输入，其中间两行只加载一次；固定长度循环由 nvcc 完全展开。
-// __launch_bounds__(一个 block 最大线程数,一个 SM 最少希望同时运行几个 block)
-__global__ __launch_bounds__(128, 10) void block1PackedDwconvHalf2Tile2DKernel(
+// 固定 11x11x2048 的 4x2 token-major tile。channel 方向拆成八个
+// 128-thread CTA；最后一个水平 tile 只有 3 个有效输出，最后一个垂直
+// tile 只有上行有效。所有边界判断在 CTA 内一致。
+__global__ __launch_bounds__(128, 10) void block4PackedDwconvHalf2Tile2DKernel(
     const __half2* __restrict__ input,
     const __half2* __restrict__ packedWeight,
     const __half2* __restrict__ packedBias,
     __half2* __restrict__ output
 ) {
-    constexpr int32_t channelPairs = kFixedChannelPairs;
-    const int32_t channelPair = static_cast<int32_t>(threadIdx.x);
+    const int32_t channelPair =
+        static_cast<int32_t>(blockIdx.z) * kChannelPairsPerBlock +
+        static_cast<int32_t>(threadIdx.x);
     const int32_t tileColumn =
         static_cast<int32_t>(blockIdx.x) * kOutputsPerTile;
     const int32_t tileRow =
         static_cast<int32_t>(blockIdx.y) * kOutputRowsPerTile;
+    const bool hasLowerOutput = tileRow + 1 < kSpatialExtent;
+
     const float2 bias = loadHalf2AsFloat2(packedBias + channelPair);
     float2 upper[kOutputsPerTile] = {bias, bias, bias, bias};
     float2 lower[kOutputsPerTile] = {bias, bias, bias, bias};
 
     const bool isInterior =
-        tileRow > 0 && tileRow + kOutputRowsPerTile < kFixedSpatialExtent &&
-        tileColumn > 0 &&
-        tileColumn + kOutputsPerTile < kFixedSpatialExtent;
+        tileRow > 0 && tileRow + kOutputRowsPerTile < kSpatialExtent &&
+        tileColumn > 0 && tileColumn + kOutputsPerTile < kSpatialExtent;
     if (isInterior) {
         constexpr int64_t rowPairStride =
-            static_cast<int64_t>(kFixedSpatialExtent) * channelPairs;
+            static_cast<int64_t>(kSpatialExtent) * kChannelPairs;
         const int64_t firstInputPairOffset =
             static_cast<int64_t>(tileRow - 1) * rowPairStride +
-            static_cast<int64_t>(tileColumn - 1) * channelPairs +
+            static_cast<int64_t>(tileColumn - 1) * kChannelPairs +
             channelPair;
 
         float2 weight0[3];
         float2 weight1[3];
         float2 weight2[3];
         float2 inputTile[6];
-        loadWeightRow(
-            packedWeight, 0, channelPair, channelPairs, weight0
-        );
-        loadWeightRow(
-            packedWeight, 1, channelPair, channelPairs, weight1
-        );
-        loadWeightRow(
-            packedWeight, 2, channelPair, channelPairs, weight2
-        );
+        loadWeightRow(packedWeight, 0, channelPair, weight0);
+        loadWeightRow(packedWeight, 1, channelPair, weight1);
+        loadWeightRow(packedWeight, 2, channelPair, weight2);
 
         loadInteriorInputRow(input + firstInputPairOffset, inputTile);
         accumulateRowTile(upper, inputTile, weight0);
@@ -231,51 +220,58 @@ __global__ __launch_bounds__(128, 10) void block1PackedDwconvHalf2Tile2DKernel(
             tileRow,
             tileColumn,
             channelPair,
-            channelPairs,
             upper
         );
-        accumulateBoundaryRow(
-            input,
-            packedWeight,
-            tileRow + 1,
-            tileColumn,
-            channelPair,
-            channelPairs,
-            lower
-        );
+        if (hasLowerOutput) {
+            accumulateBoundaryRow(
+                input,
+                packedWeight,
+                tileRow + 1,
+                tileColumn,
+                channelPair,
+                lower
+            );
+        }
     }
 
     const int64_t outputPairOffset =
-        (static_cast<int64_t>(tileRow) * kFixedSpatialExtent +
-         tileColumn) *
-            channelPairs +
+        (static_cast<int64_t>(tileRow) * kSpatialExtent + tileColumn) *
+            kChannelPairs +
         channelPair;
-    const int64_t outputRowStride =
-        static_cast<int64_t>(kFixedSpatialExtent) * channelPairs;
+    constexpr int64_t outputRowStride =
+        static_cast<int64_t>(kSpatialExtent) * kChannelPairs;
 
 #pragma unroll
     for (int32_t outputColumn = 0;
          outputColumn < kOutputsPerTile;
          ++outputColumn) {
-        const int64_t columnOffset =
-            static_cast<int64_t>(outputColumn) * channelPairs;
-        output[outputPairOffset + columnOffset] =
-            convertOutput(upper[outputColumn]);
-        output[outputPairOffset + outputRowStride + columnOffset] =
-            convertOutput(lower[outputColumn]);
+        if (tileColumn + outputColumn < kSpatialExtent) {
+            const int64_t columnOffset =
+                static_cast<int64_t>(outputColumn) * kChannelPairs;
+            output[outputPairOffset + columnOffset] =
+                convertOutput(upper[outputColumn]);
+            if (hasLowerOutput) {
+                output[outputPairOffset + outputRowStride + columnOffset] =
+                    convertOutput(lower[outputColumn]);
+            }
+        }
     }
 }
 
-void launchFixedTile2DKernel(
+void launchKernel(
     const void* input,
     const void* packedWeight,
     const void* packedBias,
     void* output,
-    const dim3& grid,
-    const dim3& block,
     cudaStream_t stream
 ) noexcept {
-    block1PackedDwconvHalf2Tile2DKernel
+    const dim3 block(kChannelPairsPerBlock);
+    const dim3 grid(
+        (kSpatialExtent + kOutputsPerTile - 1) / kOutputsPerTile,
+        (kSpatialExtent + kOutputRowsPerTile - 1) / kOutputRowsPerTile,
+        kChannelTiles
+    );
+    block4PackedDwconvHalf2Tile2DKernel
         <<<grid, block, 0, stream>>>(
             static_cast<const __half2*>(input),
             static_cast<const __half2*>(packedWeight),
@@ -284,9 +280,9 @@ void launchFixedTile2DKernel(
         );
 }
 
-} // 匿名命名空间
+} // namespace
 
-int32_t launchBlock1PackedDwconv(
+int32_t launchBlock4PackedDwconv(
     const void* input,
     const void* packedWeight,
     const void* packedBias,
@@ -298,21 +294,8 @@ int32_t launchBlock1PackedDwconv(
         return -1;
     }
 
-    const dim3 block(kFixedChannelPairs);
-    const dim3 grid(
-        kFixedSpatialExtent / kOutputsPerTile,
-        kFixedSpatialExtent / kOutputRowsPerTile
-    );
-    launchFixedTile2DKernel(
-        input,
-        packedWeight,
-        packedBias,
-        output,
-        grid,
-        block,
-        stream
-    );
+    launchKernel(input, packedWeight, packedBias, output, stream);
     return cudaPeekAtLastError() == cudaSuccess ? 0 : -1;
 }
 
-} // 命名空间 egcinet::plugins
+} // namespace egcinet::plugins

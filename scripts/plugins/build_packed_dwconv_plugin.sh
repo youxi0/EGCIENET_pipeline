@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 
-# 步骤 1：Block1/2/3 Packed DWConv 共用独立构建目录和动态库。
+# 步骤 1：Block1/2/3/4 Packed DWConv 共用独立构建目录和动态库。
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build/packed_dwconv_plugin}"
 CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES:-87}"
 JOBS="${JOBS:-$(nproc)}"
@@ -25,7 +25,7 @@ if [ -n "${TENSORRT_ROOT:-}" ]; then
     CMAKE_ARGS+=("-DTENSORRT_ROOT=${TENSORRT_ROOT}")
 fi
 
-echo "[INFO] build block1/block2/block3 packed-weight DWConv + GELU TensorRT plugin"
+echo "[INFO] build block1/block2/block3/block4 packed-weight DWConv + GELU TensorRT plugin"
 echo "[INFO] build directory: ${BUILD_DIR}"
 echo "[INFO] CUDA architectures: ${CUDA_ARCHITECTURES}"
 

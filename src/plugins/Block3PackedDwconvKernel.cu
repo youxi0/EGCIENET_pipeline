@@ -53,71 +53,32 @@ __device__ __forceinline__ __half2 convertOutput(const float2& accumulator) {
     );
 }
 
-// 同一输出行的 4 个相邻位置只加载 6 个输入 half2，并复用同一组 3-tap
-// 权重。Block3 的 channel 维由 blockIdx.z 分成五个 128-pair CTA。
-__device__ __forceinline__ void accumulateRowTile(
-    float2& accumulator0,
-    float2& accumulator1,
-    float2& accumulator2,
-    float2& accumulator3,
-    const float2& input0,
-    const float2& input1,
-    const float2& input2,
-    const float2& input3,
-    const float2& input4,
-    const float2& input5,
-    const float2& weight0,
-    const float2& weight1,
-    const float2& weight2
-) {
-    multiplyAddHalf2(accumulator0, input0, weight0);
-    multiplyAddHalf2(accumulator0, input1, weight1);
-    multiplyAddHalf2(accumulator0, input2, weight2);
-
-    multiplyAddHalf2(accumulator1, input1, weight0);
-    multiplyAddHalf2(accumulator1, input2, weight1);
-    multiplyAddHalf2(accumulator1, input3, weight2);
-
-    multiplyAddHalf2(accumulator2, input2, weight0);
-    multiplyAddHalf2(accumulator2, input3, weight1);
-    multiplyAddHalf2(accumulator2, input4, weight2);
-
-    multiplyAddHalf2(accumulator3, input3, weight0);
-    multiplyAddHalf2(accumulator3, input4, weight1);
-    multiplyAddHalf2(accumulator3, input5, weight2);
-}
-
 __device__ __forceinline__ void loadWeightRow(
     const __half2* packedWeight,
     int32_t kernelRow,
     int32_t channelPair,
-    float2& weight0,
-    float2& weight1,
-    float2& weight2
+    float2 (&weight)[3]
 ) {
     const int32_t rowOffset =
         kernelRow * 3 * kChannelPairs + channelPair;
-    weight0 = loadHalf2AsFloat2(packedWeight + rowOffset);
-    weight1 = loadHalf2AsFloat2(packedWeight + rowOffset + kChannelPairs);
-    weight2 =
-        loadHalf2AsFloat2(packedWeight + rowOffset + 2 * kChannelPairs);
+#pragma unroll
+    for (int32_t kernelColumn = 0; kernelColumn < 3; ++kernelColumn) {
+        weight[kernelColumn] = loadHalf2AsFloat2(
+            packedWeight + rowOffset + kernelColumn * kChannelPairs
+        );
+    }
 }
 
-__device__ __forceinline__ void loadInteriorInputRowTile(
+__device__ __forceinline__ void loadInteriorInputRow(
     const __half2* inputRowStart,
-    float2& input0,
-    float2& input1,
-    float2& input2,
-    float2& input3,
-    float2& input4,
-    float2& input5
+    float2 (&inputTile)[6]
 ) {
-    input0 = loadHalf2AsFloat2(inputRowStart);
-    input1 = loadHalf2AsFloat2(inputRowStart + kChannelPairs);
-    input2 = loadHalf2AsFloat2(inputRowStart + 2 * kChannelPairs);
-    input3 = loadHalf2AsFloat2(inputRowStart + 3 * kChannelPairs);
-    input4 = loadHalf2AsFloat2(inputRowStart + 4 * kChannelPairs);
-    input5 = loadHalf2AsFloat2(inputRowStart + 5 * kChannelPairs);
+#pragma unroll
+    for (int32_t inputColumn = 0; inputColumn < 6; ++inputColumn) {
+        inputTile[inputColumn] = loadHalf2AsFloat2(
+            inputRowStart + inputColumn * kChannelPairs
+        );
+    }
 }
 
 __device__ __forceinline__ float2 loadBoundaryInput(
@@ -134,6 +95,28 @@ __device__ __forceinline__ float2 loadBoundaryInput(
     );
 }
 
+// 同一输出行的 4 个相邻位置只加载 6 个输入 half2，并复用同一组 3-tap
+// 权重。循环边界均为编译期常量，nvcc 会将其完全展开。
+__device__ __forceinline__ void accumulateRowTile(
+    float2 (&accumulator)[kOutputsPerTile],
+    const float2 (&inputTile)[6],
+    const float2 (&weight)[3]
+) {
+#pragma unroll
+    for (int32_t outputColumn = 0;
+         outputColumn < kOutputsPerTile;
+         ++outputColumn) {
+#pragma unroll
+        for (int32_t kernelColumn = 0; kernelColumn < 3; ++kernelColumn) {
+            multiplyAddHalf2(
+                accumulator[outputColumn],
+                inputTile[outputColumn + kernelColumn],
+                weight[kernelColumn]
+            );
+        }
+    }
+}
+
 // 22 不能被横向 tile=4 整除，所以最后一个 tile 只有两个有效输出。
 // 边界路径对六个输入列做完整检查；所有判断在 CTA 内一致，不产生 warp
 // divergence。输出写回处再跳过最后两个无效位置。
@@ -143,10 +126,7 @@ __device__ __forceinline__ void accumulateBoundaryRow(
     int32_t outputRow,
     int32_t tileColumn,
     int32_t channelPair,
-    float2& accumulator0,
-    float2& accumulator1,
-    float2& accumulator2,
-    float2& accumulator3
+    float2 (&accumulator)[kOutputsPerTile]
 ) {
 #pragma unroll
     for (int32_t kernelRow = 0; kernelRow < 3; ++kernelRow) {
@@ -159,53 +139,20 @@ __device__ __forceinline__ void accumulateBoundaryRow(
             static_cast<int64_t>(inputRow) * kSpatialExtent * kChannelPairs;
         const __half2* inputRowStart = input + rowOffset;
 
-        float2 weight0;
-        float2 weight1;
-        float2 weight2;
-        loadWeightRow(
-            packedWeight,
-            kernelRow,
-            channelPair,
-            weight0,
-            weight1,
-            weight2
-        );
+        float2 weight[3];
+        float2 inputTile[6];
+        loadWeightRow(packedWeight, kernelRow, channelPair, weight);
 
         const int32_t firstInputColumn = tileColumn - 1;
-        const float2 input0 = loadBoundaryInput(
-            inputRowStart, firstInputColumn, channelPair
-        );
-        const float2 input1 = loadBoundaryInput(
-            inputRowStart, firstInputColumn + 1, channelPair
-        );
-        const float2 input2 = loadBoundaryInput(
-            inputRowStart, firstInputColumn + 2, channelPair
-        );
-        const float2 input3 = loadBoundaryInput(
-            inputRowStart, firstInputColumn + 3, channelPair
-        );
-        const float2 input4 = loadBoundaryInput(
-            inputRowStart, firstInputColumn + 4, channelPair
-        );
-        const float2 input5 = loadBoundaryInput(
-            inputRowStart, firstInputColumn + 5, channelPair
-        );
-
-        accumulateRowTile(
-            accumulator0,
-            accumulator1,
-            accumulator2,
-            accumulator3,
-            input0,
-            input1,
-            input2,
-            input3,
-            input4,
-            input5,
-            weight0,
-            weight1,
-            weight2
-        );
+#pragma unroll
+        for (int32_t inputColumn = 0; inputColumn < 6; ++inputColumn) {
+            inputTile[inputColumn] = loadBoundaryInput(
+                inputRowStart,
+                firstInputColumn + inputColumn,
+                channelPair
+            );
+        }
+        accumulateRowTile(accumulator, inputTile, weight);
     }
 }
 
@@ -229,14 +176,8 @@ __global__ __launch_bounds__(128, 10) void block3PackedDwconvHalf2Tile2DKernel(
         static_cast<int32_t>(blockIdx.y) * kOutputRowsPerTile;
 
     const float2 bias = loadHalf2AsFloat2(packedBias + channelPair);
-    float2 upper0 = bias;
-    float2 upper1 = bias;
-    float2 upper2 = bias;
-    float2 upper3 = bias;
-    float2 lower0 = bias;
-    float2 lower1 = bias;
-    float2 lower2 = bias;
-    float2 lower3 = bias;
+    float2 upper[kOutputsPerTile] = {bias, bias, bias, bias};
+    float2 lower[kOutputsPerTile] = {bias, bias, bias, bias};
 
     const bool isInterior =
         tileRow > 0 && tileRow + kOutputRowsPerTile < kSpatialExtent &&
@@ -249,185 +190,36 @@ __global__ __launch_bounds__(128, 10) void block3PackedDwconvHalf2Tile2DKernel(
             static_cast<int64_t>(tileColumn - 1) * kChannelPairs +
             channelPair;
 
-        float2 weight00;
-        float2 weight01;
-        float2 weight02;
-        loadWeightRow(
-            packedWeight, 0, channelPair, weight00, weight01, weight02
-        );
-        {
-            float2 input0;
-            float2 input1;
-            float2 input2;
-            float2 input3;
-            float2 input4;
-            float2 input5;
-            loadInteriorInputRowTile(
-                input + firstInputPairOffset,
-                input0,
-                input1,
-                input2,
-                input3,
-                input4,
-                input5
-            );
-            accumulateRowTile(
-                upper0,
-                upper1,
-                upper2,
-                upper3,
-                input0,
-                input1,
-                input2,
-                input3,
-                input4,
-                input5,
-                weight00,
-                weight01,
-                weight02
-            );
-        }
+        float2 weight0[3];
+        float2 weight1[3];
+        float2 weight2[3];
+        float2 inputTile[6];
+        loadWeightRow(packedWeight, 0, channelPair, weight0);
+        loadWeightRow(packedWeight, 1, channelPair, weight1);
+        loadWeightRow(packedWeight, 2, channelPair, weight2);
 
-        float2 weight10;
-        float2 weight11;
-        float2 weight12;
-        loadWeightRow(
-            packedWeight, 1, channelPair, weight10, weight11, weight12
-        );
-        {
-            float2 input0;
-            float2 input1;
-            float2 input2;
-            float2 input3;
-            float2 input4;
-            float2 input5;
-            loadInteriorInputRowTile(
-                input + firstInputPairOffset + rowPairStride,
-                input0,
-                input1,
-                input2,
-                input3,
-                input4,
-                input5
-            );
-            accumulateRowTile(
-                upper0,
-                upper1,
-                upper2,
-                upper3,
-                input0,
-                input1,
-                input2,
-                input3,
-                input4,
-                input5,
-                weight10,
-                weight11,
-                weight12
-            );
-            accumulateRowTile(
-                lower0,
-                lower1,
-                lower2,
-                lower3,
-                input0,
-                input1,
-                input2,
-                input3,
-                input4,
-                input5,
-                weight00,
-                weight01,
-                weight02
-            );
-        }
+        loadInteriorInputRow(input + firstInputPairOffset, inputTile);
+        accumulateRowTile(upper, inputTile, weight0);
 
-        float2 weight20;
-        float2 weight21;
-        float2 weight22;
-        loadWeightRow(
-            packedWeight, 2, channelPair, weight20, weight21, weight22
+        loadInteriorInputRow(
+            input + firstInputPairOffset + rowPairStride,
+            inputTile
         );
-        {
-            float2 input0;
-            float2 input1;
-            float2 input2;
-            float2 input3;
-            float2 input4;
-            float2 input5;
-            loadInteriorInputRowTile(
-                input + firstInputPairOffset + 2 * rowPairStride,
-                input0,
-                input1,
-                input2,
-                input3,
-                input4,
-                input5
-            );
-            accumulateRowTile(
-                upper0,
-                upper1,
-                upper2,
-                upper3,
-                input0,
-                input1,
-                input2,
-                input3,
-                input4,
-                input5,
-                weight20,
-                weight21,
-                weight22
-            );
-            accumulateRowTile(
-                lower0,
-                lower1,
-                lower2,
-                lower3,
-                input0,
-                input1,
-                input2,
-                input3,
-                input4,
-                input5,
-                weight10,
-                weight11,
-                weight12
-            );
-        }
+        accumulateRowTile(upper, inputTile, weight1);
+        accumulateRowTile(lower, inputTile, weight0);
 
-        {
-            float2 input0;
-            float2 input1;
-            float2 input2;
-            float2 input3;
-            float2 input4;
-            float2 input5;
-            loadInteriorInputRowTile(
-                input + firstInputPairOffset + 3 * rowPairStride,
-                input0,
-                input1,
-                input2,
-                input3,
-                input4,
-                input5
-            );
-            accumulateRowTile(
-                lower0,
-                lower1,
-                lower2,
-                lower3,
-                input0,
-                input1,
-                input2,
-                input3,
-                input4,
-                input5,
-                weight20,
-                weight21,
-                weight22
-            );
-        }
+        loadInteriorInputRow(
+            input + firstInputPairOffset + 2 * rowPairStride,
+            inputTile
+        );
+        accumulateRowTile(upper, inputTile, weight2);
+        accumulateRowTile(lower, inputTile, weight1);
+
+        loadInteriorInputRow(
+            input + firstInputPairOffset + 3 * rowPairStride,
+            inputTile
+        );
+        accumulateRowTile(lower, inputTile, weight2);
     } else {
         accumulateBoundaryRow(
             input,
@@ -435,10 +227,7 @@ __global__ __launch_bounds__(128, 10) void block3PackedDwconvHalf2Tile2DKernel(
             tileRow,
             tileColumn,
             channelPair,
-            upper0,
-            upper1,
-            upper2,
-            upper3
+            upper
         );
         accumulateBoundaryRow(
             input,
@@ -446,10 +235,7 @@ __global__ __launch_bounds__(128, 10) void block3PackedDwconvHalf2Tile2DKernel(
             tileRow + 1,
             tileColumn,
             channelPair,
-            lower0,
-            lower1,
-            lower2,
-            lower3
+            lower
         );
     }
 
@@ -461,26 +247,18 @@ __global__ __launch_bounds__(128, 10) void block3PackedDwconvHalf2Tile2DKernel(
     constexpr int64_t outputRowStride =
         static_cast<int64_t>(kSpatialExtent) * kChannelPairs;
 
-    output[outputPairOffset] = convertOutput(upper0);
-    output[outputPairOffset + outputRowStride] =
-        convertOutput(lower0);
-    if (tileColumn + 1 < kSpatialExtent) {
-        output[outputPairOffset + kChannelPairs] =
-            convertOutput(upper1);
-        output[outputPairOffset + outputRowStride + kChannelPairs] =
-            convertOutput(lower1);
-    }
-    if (tileColumn + 2 < kSpatialExtent) {
-        output[outputPairOffset + 2 * kChannelPairs] =
-            convertOutput(upper2);
-        output[outputPairOffset + outputRowStride + 2 * kChannelPairs] =
-            convertOutput(lower2);
-    }
-    if (tileColumn + 3 < kSpatialExtent) {
-        output[outputPairOffset + 3 * kChannelPairs] =
-            convertOutput(upper3);
-        output[outputPairOffset + outputRowStride + 3 * kChannelPairs] =
-            convertOutput(lower3);
+#pragma unroll
+    for (int32_t outputColumn = 0;
+         outputColumn < kOutputsPerTile;
+         ++outputColumn) {
+        if (tileColumn + outputColumn < kSpatialExtent) {
+            const int64_t columnOffset =
+                static_cast<int64_t>(outputColumn) * kChannelPairs;
+            output[outputPairOffset + columnOffset] =
+                convertOutput(upper[outputColumn]);
+            output[outputPairOffset + outputRowStride + columnOffset] =
+                convertOutput(lower[outputColumn]);
+        }
     }
 }
 

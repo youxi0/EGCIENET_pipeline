@@ -161,14 +161,15 @@ if(EGCINET_BUILD_PIPELINE OR EGCINET_BUILD_BLOCK1_FUSED_PLUGIN OR
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
-# 最终 V14 插件只接收激活；half2 权重和 bias 作为序列化字段由插件持有。
-# Block1/2/3 kernel 都固定融合 half2 tanh GELU；TensorRT plugin 按算子
+# Packed DWConv 插件只接收激活；half2 权重和 bias 作为序列化字段由插件持有。
+# Block1/2/3/4 kernel 都固定融合 half2 tanh GELU；TensorRT plugin 按算子
 # 统一管理，CUDA kernel 则按具体形状和 channel 分块策略拆分。
 if(EGCINET_BUILD_PACKED_DWCONV_PLUGIN)
     add_library(egcinet_packed_dwconv_plugin SHARED
         src/plugins/Block1PackedDwconvKernel.cu
         src/plugins/Block2PackedDwconvKernel.cu
         src/plugins/Block3PackedDwconvKernel.cu
+        src/plugins/Block4PackedDwconvKernel.cu
         src/plugins/PackedDwconvPlugin.cpp
     )
 

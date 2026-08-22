@@ -14,7 +14,7 @@
 
 namespace egcinet::plugins {
 
-// 现有 v12/v14 ONNX 和 engine 使用该 creator 名；类和文件已经按算子命名，
+// 现有 v12-v16 ONNX 和 engine 使用该 creator 名；类和文件已经按算子命名，
 // creator 字符串需等重新导出模型后再单独升级版本。
 inline constexpr char kPackedDwconvPluginName[] =
     "EGCINET_Block1PackedDwconv";
@@ -25,7 +25,7 @@ struct PackedDwconvHostParameters;
 struct PackedDwconvDeviceParameters;
 
 // 单输入 IPluginV3：计算 token-major Packed DWConv，并固定融合 half2 tanh
-// GELU。TensorRT 生命周期和序列化由这里统一管理，Block1/2/3 的支持形状
+// GELU。TensorRT 生命周期和序列化由这里统一管理，Block1/2/3/4 的支持形状
 // 分别派发到独立的 CUDA kernel 文件。
 // fuse_gelu 字段仅为 V14 engine 的序列化兼容保留，并且必须等于 1。
 // 权重和 bias 已经由 ONNX 改图脚本按 half2 访问顺序打包，插件创建时一次性
