@@ -5,12 +5,12 @@ set -Eeuo pipefail
 PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 source "${PROJECT_ROOT}/scripts/common/tensorrt_env.sh"
 
-# V16：三个 Block4 11x11x2048 节点直接消费 token-major fc1 输出，
-# 在 packed kernel 内完成 DWConv + GELU，删除前后的 NCHW 布局转换。
+# V17：在 18 个 Block3 attention q/MatMul 的 activation 与 weight 输入上
+# 插入显式 Q/DQ。activation 使用逐张量 scale，weight 使用逐输出通道 scale。
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
 PLUGIN_BUILD_DIR="${PLUGIN_BUILD_DIR:-${PROJECT_ROOT}/build/packed_dwconv_plugin}"
-ONNX="${ONNX:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v16_block4_packed_dwconv_gelu.onnx}"
-ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v16_block4_packed_dwconv_gelu.engine}"
+ONNX="${ONNX:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v17_block3_attn_q_matmul_qdq.onnx}"
+ENGINE="${ENGINE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v17_block3_attn_q_matmul_qdq.engine}"
 PLUGIN_SO="${PLUGIN_SO:-${PLUGIN_BUILD_DIR}/lib/libegcinet_packed_dwconv_plugin.so}"
 WORKSPACE_MIB="${WORKSPACE_MIB:-256}"
 TIMING_CACHE="${TIMING_CACHE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v13_v14.timing.cache}"
@@ -20,8 +20,7 @@ LAYER_INFO="${LAYER_INFO:-${ENGINE%.engine}_layers.json}"
 TRTEXEC=$(resolve_trtexec)
 
 if [ ! -s "${ONNX}" ]; then
-    echo "[ERROR] V16 ONNX model not found: ${ONNX}" >&2
-    echo "[INFO] generate it with scripts/onnx/fuse_block4_packed_dwconv_gelu.py" >&2
+    echo "[ERROR] V17 ONNX model not found: ${ONNX}" >&2
     exit 1
 fi
 if [ ! -s "${PLUGIN_SO}" ]; then
@@ -36,7 +35,7 @@ mkdir -p "$(dirname "${TIMING_CACHE}")"
 mkdir -p "$(dirname "${LAYER_INFO}")"
 mkdir -p "${TRT_TEMP_DIR}"
 
-echo "[INFO] build V16 Block4 packed DWConv + GELU engine"
+echo "[INFO] build V17 Block3 attention Q MatMul Q/DQ engine"
 echo "[INFO] trtexec: ${TRTEXEC}"
 echo "[INFO] onnx: ${ONNX}"
 echo "[INFO] plugin: ${PLUGIN_SO}"
@@ -68,6 +67,6 @@ if [ ! -s "${LAYER_INFO}" ]; then
     exit 1
 fi
 
-echo "[PASS] V16 engine: ${ENGINE}"
+echo "[PASS] V17 engine: ${ENGINE}"
 echo "[PASS] layer info: ${LAYER_INFO}"
 echo "[NOTE] Load ${PLUGIN_SO} before deserializing this engine."
