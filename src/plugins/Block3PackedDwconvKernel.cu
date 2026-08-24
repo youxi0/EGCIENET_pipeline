@@ -19,22 +19,20 @@ constexpr float kGeluScaledCubic =
 
 static_assert(kChannelPairs % kChannelPairsPerBlock == 0);
 
-__device__ __forceinline__ float2 loadHalf2AsFloat2(const __half2* address) {
-    return __half22float2(*address);
-}
-
 __device__ __forceinline__ void multiplyAddHalf2(
-    float2& accumulator,
-    const float2& input,
-    const float2& weight
+    __half2& accumulator,
+    const __half2& input,
+    const __half2& weight
 ) {
-    accumulator.x = fmaf(input.x, weight.x, accumulator.x);
-    accumulator.y = fmaf(input.y, weight.y, accumulator.y);
+    accumulator = __hfma2(input, weight, accumulator);
 }
 
 // 与 Block1 保持相同的 PyTorch tanh GELU 近似和常量折叠。
-// 保留 FP32 多项式与最终 FMA，只把两路 tanh 合并为一条 f16x2 指令。
-__device__ __forceinline__ __half2 convertOutput(const float2& accumulator) {
+// 卷积使用 half2 FP16 累加，GELU 前只转换一次为 float2；保留 FP32
+// 多项式与最终 FMA，并把两路 tanh 合并为一条 f16x2 指令。
+__device__ __forceinline__ __half2 convertFloat2Output(
+    const float2& accumulator
+) {
     const float xSquared0 = accumulator.x * accumulator.x;
     const float xSquared1 = accumulator.y * accumulator.y;
     const float tanhInput0 = accumulator.x *
@@ -53,38 +51,42 @@ __device__ __forceinline__ __half2 convertOutput(const float2& accumulator) {
     );
 }
 
+__device__ __forceinline__ __half2 convertOutput(
+    const __half2& packedAccumulator
+) {
+    return convertFloat2Output(__half22float2(packedAccumulator));
+}
+
 __device__ __forceinline__ void loadWeightRow(
     const __half2* packedWeight,
     int32_t kernelRow,
     int32_t channelPair,
-    float2 (&weight)[3]
+    __half2 (&weight)[3]
 ) {
     const int32_t rowOffset =
         kernelRow * 3 * kChannelPairs + channelPair;
 #pragma unroll
     for (int32_t kernelColumn = 0; kernelColumn < 3; ++kernelColumn) {
-        weight[kernelColumn] = loadHalf2AsFloat2(
-            packedWeight + rowOffset + kernelColumn * kChannelPairs
-        );
+        weight[kernelColumn] =
+            packedWeight[rowOffset + kernelColumn * kChannelPairs];
     }
 }
 
 __device__ __forceinline__ void loadInteriorInputRow(
     const __half2* inputRowStart,
-    float2 (&inputTile)[6]
+    __half2 (&inputTile)[6]
 ) {
 #pragma unroll
     for (int32_t inputColumn = 0; inputColumn < 6; ++inputColumn) {
-        inputTile[inputColumn] = loadHalf2AsFloat2(
-            inputRowStart + inputColumn * kChannelPairs
-        );
+        inputTile[inputColumn] =
+            inputRowStart[inputColumn * kChannelPairs];
     }
 }
 
 __device__ __forceinline__ void storeOutputRow(
     __half2* outputRowStart,
     int32_t tileColumn,
-    const float2 (&accumulator)[kOutputsPerTile]
+    const __half2 (&accumulator)[kOutputsPerTile]
 ) {
 #pragma unroll
     for (int32_t outputColumn = 0;
@@ -97,26 +99,25 @@ __device__ __forceinline__ void storeOutputRow(
     }
 }
 
-__device__ __forceinline__ float2 loadBoundaryInput(
+__device__ __forceinline__ __half2 loadBoundaryInput(
     const __half2* inputRowStart,
     int32_t column,
     int32_t channelPair
 ) {
     if (column < 0 || column >= kSpatialExtent) {
-        return make_float2(0.0F, 0.0F);
+        return __float2half2_rn(0.0F);
     }
-    return loadHalf2AsFloat2(
-        inputRowStart +
+    return inputRowStart[
         static_cast<int64_t>(column) * kChannelPairs + channelPair
-    );
+    ];
 }
 
 // 同一输出行的 4 个相邻位置只加载 6 个输入 half2，并复用同一组 3-tap
 // 权重。循环边界均为编译期常量，nvcc 会将其完全展开。
 __device__ __forceinline__ void accumulateRowTile(
-    float2 (&accumulator)[kOutputsPerTile],
-    const float2 (&inputTile)[6],
-    const float2 (&weight)[3]
+    __half2 (&accumulator)[kOutputsPerTile],
+    const __half2 (&inputTile)[6],
+    const __half2 (&weight)[3]
 ) {
 #pragma unroll
     for (int32_t outputColumn = 0;
@@ -142,7 +143,7 @@ __device__ __forceinline__ void accumulateBoundaryRow(
     int32_t outputRow,
     int32_t tileColumn,
     int32_t channelPair,
-    float2 (&accumulator)[kOutputsPerTile]
+    __half2 (&accumulator)[kOutputsPerTile]
 ) {
 #pragma unroll
     for (int32_t kernelRow = 0; kernelRow < 3; ++kernelRow) {
@@ -155,8 +156,8 @@ __device__ __forceinline__ void accumulateBoundaryRow(
             static_cast<int64_t>(inputRow) * kSpatialExtent * kChannelPairs;
         const __half2* inputRowStart = input + rowOffset;
 
-        float2 weight[3];
-        float2 inputTile[6];
+        __half2 weight[3];
+        __half2 inputTile[6];
         loadWeightRow(packedWeight, kernelRow, channelPair, weight);
 
         const int32_t firstInputColumn = tileColumn - 1;
@@ -191,9 +192,9 @@ __global__ void block3PackedDwconvHalf2Tile2DKernel(
     const int32_t tileRow =
         static_cast<int32_t>(blockIdx.y) * kOutputRowsPerTile;
 
-    const float2 bias = loadHalf2AsFloat2(packedBias + channelPair);
-    float2 upper[kOutputsPerTile] = {bias, bias, bias, bias};
-    float2 lower[kOutputsPerTile] = {bias, bias, bias, bias};
+    const __half2 bias = packedBias[channelPair];
+    __half2 upper[kOutputsPerTile] = {bias, bias, bias, bias};
+    __half2 lower[kOutputsPerTile] = {bias, bias, bias, bias};
 
     const int64_t outputPairOffset =
         (static_cast<int64_t>(tileRow) * kSpatialExtent + tileColumn) *
@@ -213,9 +214,9 @@ __global__ void block3PackedDwconvHalf2Tile2DKernel(
             static_cast<int64_t>(tileColumn - 1) * kChannelPairs +
             channelPair;
 
-        float2 weightA[3];
-        float2 weightB[3];
-        float2 inputTile[6];
+        __half2 weightA[3];
+        __half2 weightB[3];
+        __half2 inputTile[6];
 
         loadWeightRow(packedWeight, 0, channelPair, weightA);
         loadInteriorInputRow(input + firstInputPairOffset, inputTile);
