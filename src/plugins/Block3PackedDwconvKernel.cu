@@ -7,8 +7,10 @@ namespace egcinet::plugins {
 namespace {
 
 constexpr int32_t kOutputsPerTile = 4;
+constexpr int32_t kInputsPerTile = kOutputsPerTile + 2;
 constexpr int32_t kOutputRowsPerTile = 2;
 constexpr int32_t kSpatialExtent = 22;
+constexpr int32_t kTailOutputs = kSpatialExtent % kOutputsPerTile;
 constexpr int32_t kChannelPairs = 640; // 1280channels / 2
 constexpr int32_t kChannelPairsPerBlock = 128;
 constexpr int32_t kChannelTiles =
@@ -18,6 +20,7 @@ constexpr float kGeluScaledCubic =
     0.035677406936883926F; // scale * 0.044715 常量折叠
 
 static_assert(kChannelPairs % kChannelPairsPerBlock == 0);
+static_assert(kTailOutputs > 0);
 
 __device__ __forceinline__ void multiplyAddHalf2(
     __half2& accumulator,
@@ -74,54 +77,42 @@ __device__ __forceinline__ void loadWeightRow(
 
 __device__ __forceinline__ void loadInteriorInputRow(
     const __half2* inputRowStart,
-    __half2 (&inputTile)[6]
+    __half2 (&inputTile)[kInputsPerTile]
 ) {
 #pragma unroll
-    for (int32_t inputColumn = 0; inputColumn < 6; ++inputColumn) {
+    for (int32_t inputColumn = 0;
+         inputColumn < kInputsPerTile;
+         ++inputColumn) {
         inputTile[inputColumn] =
             inputRowStart[inputColumn * kChannelPairs];
     }
 }
 
+template <int32_t OutputCount>
 __device__ __forceinline__ void storeOutputRow(
     __half2* outputRowStart,
-    int32_t tileColumn,
     const __half2 (&accumulator)[kOutputsPerTile]
 ) {
+    static_assert(OutputCount > 0 && OutputCount <= kOutputsPerTile);
 #pragma unroll
-    for (int32_t outputColumn = 0;
-         outputColumn < kOutputsPerTile;
-         ++outputColumn) {
-        if (tileColumn + outputColumn < kSpatialExtent) {
-            outputRowStart[outputColumn * kChannelPairs] =
-                convertOutput(accumulator[outputColumn]);
-        }
+    for (int32_t outputColumn = 0; outputColumn < OutputCount; ++outputColumn) {
+        outputRowStart[outputColumn * kChannelPairs] =
+            convertOutput(accumulator[outputColumn]);
     }
-}
-
-__device__ __forceinline__ __half2 loadBoundaryInput(
-    const __half2* inputRowStart,
-    int32_t column,
-    int32_t channelPair
-) {
-    if (column < 0 || column >= kSpatialExtent) {
-        return __float2half2_rn(0.0F);
-    }
-    return inputRowStart[
-        static_cast<int64_t>(column) * kChannelPairs + channelPair
-    ];
 }
 
 // 同一输出行的 4 个相邻位置只加载 6 个输入 half2，并复用同一组 3-tap
 // 权重。循环边界均为编译期常量，nvcc 会将其完全展开。
+template <int32_t OutputCount>
 __device__ __forceinline__ void accumulateRowTile(
     __half2 (&accumulator)[kOutputsPerTile],
-    const __half2 (&inputTile)[6],
+    const __half2 (&inputTile)[OutputCount + 2],
     const __half2 (&weight)[3]
 ) {
+    static_assert(OutputCount > 0 && OutputCount <= kOutputsPerTile);
 #pragma unroll
     for (int32_t outputColumn = 0;
-         outputColumn < kOutputsPerTile;
+         outputColumn < OutputCount;
          ++outputColumn) {
 #pragma unroll
         for (int32_t kernelColumn = 0; kernelColumn < 3; ++kernelColumn) {
@@ -134,43 +125,111 @@ __device__ __forceinline__ void accumulateRowTile(
     }
 }
 
-// 22 不能被横向 tile=4 整除，所以最后一个 tile 只有两个有效输出。
-// 边界路径对六个输入列做完整检查；所有判断在 CTA 内一致，不产生 warp
-// divergence。输出写回处再跳过最后两个无效位置。
-__device__ __forceinline__ void accumulateBoundaryRow(
+template <int32_t OutputCount>
+__device__ __forceinline__ void loadBoundaryInputRow(
     const __half2* input,
-    const __half2* packedWeight,
-    int32_t outputRow,
+    int32_t inputRow,
     int32_t tileColumn,
     int32_t channelPair,
-    __half2 (&accumulator)[kOutputsPerTile]
+    __half2 (&inputTile)[OutputCount + 2]
 ) {
+    static_assert(OutputCount > 0 && OutputCount <= kOutputsPerTile);
+    if (inputRow < 0 || inputRow >= kSpatialExtent) {
 #pragma unroll
-    for (int32_t kernelRow = 0; kernelRow < 3; ++kernelRow) {
-        const int32_t inputRow = outputRow + kernelRow - 1;
-        if (inputRow < 0 || inputRow >= kSpatialExtent) {
-            continue;
+        for (int32_t inputColumn = 0;
+             inputColumn < OutputCount + 2;
+             ++inputColumn) {
+            inputTile[inputColumn] = __float2half2_rn(0.0F);
         }
-
-        const int64_t rowOffset =
-            static_cast<int64_t>(inputRow) * kSpatialExtent * kChannelPairs;
-        const __half2* inputRowStart = input + rowOffset;
-
-        __half2 weight[3];
-        __half2 inputTile[6];
-        loadWeightRow(packedWeight, kernelRow, channelPair, weight);
-
-        const int32_t firstInputColumn = tileColumn - 1;
-#pragma unroll
-        for (int32_t inputColumn = 0; inputColumn < 6; ++inputColumn) {
-            inputTile[inputColumn] = loadBoundaryInput(
-                inputRowStart,
-                firstInputColumn + inputColumn,
-                channelPair
-            );
-        }
-        accumulateRowTile(accumulator, inputTile, weight);
+        return;
     }
+
+    const int64_t rowOffset =
+        static_cast<int64_t>(inputRow) * kSpatialExtent * kChannelPairs;
+    const __half2* inputRowStart = input + rowOffset + channelPair;
+    if constexpr (OutputCount < kOutputsPerTile) {
+        const __half2* firstInput = inputRowStart +
+            static_cast<int64_t>(tileColumn - 1) * kChannelPairs;
+#pragma unroll
+        for (int32_t inputColumn = 0;
+             inputColumn < OutputCount + 1;
+             ++inputColumn) {
+            inputTile[inputColumn] =
+                firstInput[inputColumn * kChannelPairs];
+        }
+        inputTile[OutputCount + 1] = __float2half2_rn(0.0F);
+        return;
+    }
+
+    if (tileColumn == 0) {
+        inputTile[0] = __float2half2_rn(0.0F);
+#pragma unroll
+        for (int32_t inputColumn = 1;
+             inputColumn < OutputCount + 2;
+             ++inputColumn) {
+            inputTile[inputColumn] =
+                inputRowStart[(inputColumn - 1) * kChannelPairs];
+        }
+        return;
+    }
+
+    const __half2* firstInput = inputRowStart +
+        static_cast<int64_t>(tileColumn - 1) * kChannelPairs;
+#pragma unroll
+    for (int32_t inputColumn = 0;
+         inputColumn < OutputCount + 2;
+         ++inputColumn) {
+        inputTile[inputColumn] =
+            firstInput[inputColumn * kChannelPairs];
+    }
+}
+
+// 边界 CTA 复用相邻两输出行的中间 input 行和三行 weight；尾 CTA
+// 由 OutputCount 在编译期裁掉无效列，不再计算额外的卷积与 GELU。
+template <int32_t OutputCount>
+__device__ __forceinline__ void processBoundaryTile(
+    const __half2* input,
+    const __half2* packedWeight,
+    __half2* outputRowStart,
+    int32_t tileRow,
+    int32_t tileColumn,
+    int32_t channelPair,
+    __half2 (&upper)[kOutputsPerTile],
+    __half2 (&lower)[kOutputsPerTile]
+) {
+    __half2 weightA[3];
+    __half2 weightB[3];
+    __half2 inputTile[OutputCount + 2];
+
+    loadWeightRow(packedWeight, 0, channelPair, weightA);
+    loadBoundaryInputRow<OutputCount>(
+        input, tileRow - 1, tileColumn, channelPair, inputTile
+    );
+    accumulateRowTile<OutputCount>(upper, inputTile, weightA);
+
+    loadWeightRow(packedWeight, 1, channelPair, weightB);
+    loadBoundaryInputRow<OutputCount>(
+        input, tileRow, tileColumn, channelPair, inputTile
+    );
+    accumulateRowTile<OutputCount>(upper, inputTile, weightB);
+    accumulateRowTile<OutputCount>(lower, inputTile, weightA);
+
+    loadWeightRow(packedWeight, 2, channelPair, weightA);
+    loadBoundaryInputRow<OutputCount>(
+        input, tileRow + 1, tileColumn, channelPair, inputTile
+    );
+    accumulateRowTile<OutputCount>(upper, inputTile, weightA);
+    accumulateRowTile<OutputCount>(lower, inputTile, weightB);
+
+    storeOutputRow<OutputCount>(outputRowStart, upper);
+
+    loadBoundaryInputRow<OutputCount>(
+        input, tileRow + 2, tileColumn, channelPair, inputTile
+    );
+    accumulateRowTile<OutputCount>(lower, inputTile, weightA);
+    constexpr int64_t outputRowStride =
+        static_cast<int64_t>(kSpatialExtent) * kChannelPairs;
+    storeOutputRow<OutputCount>(outputRowStart + outputRowStride, lower);
 }
 
 // 固定 22x22x1280 的 4x2 tile。相邻输出行共享中间两行输入；channel
@@ -191,6 +250,8 @@ __global__ void block3PackedDwconvHalf2Tile2DKernel(
         static_cast<int32_t>(blockIdx.x) * kOutputsPerTile;
     const int32_t tileRow =
         static_cast<int32_t>(blockIdx.y) * kOutputRowsPerTile;
+    const bool isTailTile =
+        tileColumn + kOutputsPerTile > kSpatialExtent;
 
     const __half2 bias = packedBias[channelPair];
     __half2 upper[kOutputsPerTile] = {bias, bias, bias, bias};
@@ -216,58 +277,64 @@ __global__ void block3PackedDwconvHalf2Tile2DKernel(
 
         __half2 weightA[3];
         __half2 weightB[3];
-        __half2 inputTile[6];
+        __half2 inputTile[kInputsPerTile];
 
         loadWeightRow(packedWeight, 0, channelPair, weightA);
         loadInteriorInputRow(input + firstInputPairOffset, inputTile);
-        accumulateRowTile(upper, inputTile, weightA);
+        accumulateRowTile<kOutputsPerTile>(upper, inputTile, weightA);
 
         loadWeightRow(packedWeight, 1, channelPair, weightB);
         loadInteriorInputRow(
             input + firstInputPairOffset + rowPairStride,
             inputTile
         );
-        accumulateRowTile(upper, inputTile, weightB);
-        accumulateRowTile(lower, inputTile, weightA);
+        accumulateRowTile<kOutputsPerTile>(upper, inputTile, weightB);
+        accumulateRowTile<kOutputsPerTile>(lower, inputTile, weightA);
 
         loadWeightRow(packedWeight, 2, channelPair, weightA);
         loadInteriorInputRow(
             input + firstInputPairOffset + 2 * rowPairStride,
             inputTile
         );
-        accumulateRowTile(upper, inputTile, weightA);
-        accumulateRowTile(lower, inputTile, weightB);
+        accumulateRowTile<kOutputsPerTile>(upper, inputTile, weightA);
+        accumulateRowTile<kOutputsPerTile>(lower, inputTile, weightB);
 
-        storeOutputRow(output + outputPairOffset, tileColumn, upper);
+        storeOutputRow<kOutputsPerTile>(output + outputPairOffset, upper);
 
         loadInteriorInputRow(
             input + firstInputPairOffset + 3 * rowPairStride,
             inputTile
         );
-        accumulateRowTile(lower, inputTile, weightA);
-    } else {
-        accumulateBoundaryRow(
+        accumulateRowTile<kOutputsPerTile>(lower, inputTile, weightA);
+        storeOutputRow<kOutputsPerTile>(
+            output + outputPairOffset + outputRowStride,
+            lower
+        );
+        return;
+    }
+
+    if (isTailTile) {
+        processBoundaryTile<kTailOutputs>(
             input,
             packedWeight,
+            output + outputPairOffset,
             tileRow,
             tileColumn,
             channelPair,
-            upper
-        );
-        storeOutputRow(output + outputPairOffset, tileColumn, upper);
-        accumulateBoundaryRow(
-            input,
-            packedWeight,
-            tileRow + 1,
-            tileColumn,
-            channelPair,
+            upper,
             lower
         );
+        return;
     }
 
-    storeOutputRow(
-        output + outputPairOffset + outputRowStride,
+    processBoundaryTile<kOutputsPerTile>(
+        input,
+        packedWeight,
+        output + outputPairOffset,
+        tileRow,
         tileColumn,
+        channelPair,
+        upper,
         lower
     );
 }

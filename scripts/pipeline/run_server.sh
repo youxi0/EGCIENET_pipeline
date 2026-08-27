@@ -66,7 +66,8 @@ if [ -z "${EGCINET_TRT_PLUGIN_LIBS:-}" ]; then
     AUTO_PLUGIN_LIBS=()
     for plugin_library in \
         "${BUILD_DIR}/lib/libegcinet_block1_fused_plugin.so" \
-        "${BUILD_DIR}/lib/libegcinet_packed_dwconv_plugin.so"
+        "${BUILD_DIR}/lib/libegcinet_packed_dwconv_plugin.so" \
+        "${BUILD_DIR}/lib/libegcinet_fused_sr_plugin.so"
     do
         if [ -f "${plugin_library}" ]; then
             AUTO_PLUGIN_LIBS+=("${plugin_library}")

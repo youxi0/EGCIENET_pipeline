@@ -9,8 +9,9 @@ BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 BUILD_PIPELINE="${BUILD_PIPELINE:-ON}"
 BUILD_INT8_CALIBRATOR="${BUILD_INT8_CALIBRATOR:-OFF}"
-BUILD_BLOCK1_FUSED_PLUGIN="${BUILD_BLOCK1_FUSED_PLUGIN:-ON}"
+BUILD_BLOCK1_FUSED_PLUGIN="${BUILD_BLOCK1_FUSED_PLUGIN:-OFF}"
 BUILD_PACKED_DWCONV_PLUGIN="${BUILD_PACKED_DWCONV_PLUGIN:-ON}"
+BUILD_FUSED_SR_PLUGIN="${BUILD_FUSED_SR_PLUGIN:-ON}"
 CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES:-87}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
@@ -30,6 +31,7 @@ validate_switch BUILD_PIPELINE "${BUILD_PIPELINE}"
 validate_switch BUILD_INT8_CALIBRATOR "${BUILD_INT8_CALIBRATOR}"
 validate_switch BUILD_BLOCK1_FUSED_PLUGIN "${BUILD_BLOCK1_FUSED_PLUGIN}"
 validate_switch BUILD_PACKED_DWCONV_PLUGIN "${BUILD_PACKED_DWCONV_PLUGIN}"
+validate_switch BUILD_FUSED_SR_PLUGIN "${BUILD_FUSED_SR_PLUGIN}"
 
 echo "[INFO] project root:         ${PROJECT_ROOT}"
 echo "[INFO] build dir:            ${BUILD_DIR}"
@@ -40,6 +42,7 @@ echo "[INFO] pipeline:             ${BUILD_PIPELINE}"
 echo "[INFO] INT8 calibrator:      ${BUILD_INT8_CALIBRATOR}"
 echo "[INFO] Block1 fused plugin:  ${BUILD_BLOCK1_FUSED_PLUGIN}"
 echo "[INFO] packed DWConv plugin: ${BUILD_PACKED_DWCONV_PLUGIN}"
+echo "[INFO] fused SR plugin:       ${BUILD_FUSED_SR_PLUGIN}"
 
 configure_tensorrt_library_path
 
@@ -52,6 +55,7 @@ CMAKE_ARGS=(
     "-DEGCINET_BUILD_INT8_CALIBRATOR=${BUILD_INT8_CALIBRATOR}"
     "-DEGCINET_BUILD_BLOCK1_FUSED_PLUGIN=${BUILD_BLOCK1_FUSED_PLUGIN}"
     "-DEGCINET_BUILD_PACKED_DWCONV_PLUGIN=${BUILD_PACKED_DWCONV_PLUGIN}"
+    "-DEGCINET_BUILD_FUSED_SR_PLUGIN=${BUILD_FUSED_SR_PLUGIN}"
 )
 
 if [ -n "${TENSORRT_ROOT:-}" ]; then
@@ -91,9 +95,23 @@ if [ "${BUILD_PACKED_DWCONV_PLUGIN}" = "ON" ]; then
     require_output "${BUILD_DIR}/lib/libegcinet_packed_dwconv_plugin.so"
 fi
 
+if [ "${BUILD_FUSED_SR_PLUGIN}" = "ON" ]; then
+    require_output "${BUILD_DIR}/lib/libegcinet_fused_sr_plugin.so"
+fi
+
 echo "[PASS] full build finished"
 
-if [ "${BUILD_PACKED_DWCONV_PLUGIN}" = "ON" ]; then
-    echo "[INFO] load the fused packed DWConv plugin with:"
-    echo "       export EGCINET_TRT_PLUGIN_LIBS=${BUILD_DIR}/lib/libegcinet_packed_dwconv_plugin.so"
+if [ "${BUILD_PACKED_DWCONV_PLUGIN}" = "ON" ] ||
+   [ "${BUILD_FUSED_SR_PLUGIN}" = "ON" ]; then
+    RUNTIME_PLUGIN_LIBS=()
+    if [ "${BUILD_PACKED_DWCONV_PLUGIN}" = "ON" ]; then
+        RUNTIME_PLUGIN_LIBS+=("${BUILD_DIR}/lib/libegcinet_packed_dwconv_plugin.so")
+    fi
+    if [ "${BUILD_FUSED_SR_PLUGIN}" = "ON" ]; then
+        RUNTIME_PLUGIN_LIBS+=("${BUILD_DIR}/lib/libegcinet_fused_sr_plugin.so")
+    fi
+    printf -v RUNTIME_PLUGIN_PATHS '%s:' "${RUNTIME_PLUGIN_LIBS[@]}"
+    RUNTIME_PLUGIN_PATHS="${RUNTIME_PLUGIN_PATHS%:}"
+    echo "[INFO] load the runtime plugins with:"
+    echo "       export EGCINET_TRT_PLUGIN_LIBS=${RUNTIME_PLUGIN_PATHS}"
 fi

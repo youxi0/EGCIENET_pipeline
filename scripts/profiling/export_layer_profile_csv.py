@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Export a descending CSV with average time, layer name/type, "
-            "and input/output tensor names."
+            "input/output tensor names and datatypes, weight datatypes, and tactics."
         )
     )
     parser.add_argument("profile", type=Path, help="trtexec --exportProfile JSON")
@@ -33,9 +33,16 @@ def load_json(path: Path) -> Any:
         return json.load(source)
 
 
-def tensor_names(layer: dict[str, Any], field: str) -> str:
+def tensor_values(layer: dict[str, Any], field: str, key: str) -> str:
     tensors = layer.get(field, [])
-    return ";".join(str(tensor.get("Name", "")) for tensor in tensors)
+    return ";".join(str(tensor.get(key, "")) for tensor in tensors)
+
+
+def parameter_datatype(layer: dict[str, Any], field: str) -> str:
+    parameter = layer.get(field)
+    if not isinstance(parameter, dict):
+        return ""
+    return str(parameter.get("Type", ""))
 
 
 def main() -> None:
@@ -81,7 +88,19 @@ def main() -> None:
     with args.output.open("wt", encoding="utf-8", newline="") as destination:
         writer = csv.writer(destination)
         writer.writerow(
-            ["average_ms", "layer_name", "layer_type", "input_names", "output_names"]
+            [
+                "average_ms",
+                "layer_name",
+                "layer_type",
+                "parameter_type",
+                "input_names",
+                "input_datatypes",
+                "output_names",
+                "output_datatypes",
+                "weight_datatype",
+                "bias_datatype",
+                "tactic_name",
+            ]
         )
         for timing in timing_rows:
             layer = layer_by_name[timing["name"]]
@@ -90,8 +109,14 @@ def main() -> None:
                     f'{float(timing["averageMs"]):.9f}',
                     timing["name"],
                     layer.get("LayerType", ""),
-                    tensor_names(layer, "Inputs"),
-                    tensor_names(layer, "Outputs"),
+                    layer.get("ParameterType", ""),
+                    tensor_values(layer, "Inputs", "Name"),
+                    tensor_values(layer, "Inputs", "Format/Datatype"),
+                    tensor_values(layer, "Outputs", "Name"),
+                    tensor_values(layer, "Outputs", "Format/Datatype"),
+                    parameter_datatype(layer, "Weights"),
+                    parameter_datatype(layer, "Bias"),
+                    layer.get("TacticName", ""),
                 ]
             )
 

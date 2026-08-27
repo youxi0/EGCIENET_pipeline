@@ -15,6 +15,13 @@
 ```bash
 bash scripts/pipeline/build.sh
 bash scripts/plugins/build_packed_dwconv_plugin.sh
+bash scripts/plugins/build_fused_sr_plugin.sh
+python3 scripts/onnx/quantize_block3_fused_sr.py INPUT_V24.onnx OUTPUT_V25.onnx
+bash scripts/engine/build_v25_block3_int8_sr_engine.sh
+bash scripts/profiling/benchmark_v25_block3_int8_sr_engine.sh
+python3 scripts/onnx/quantize_block12_fused_sr.py INPUT_V25.onnx OUTPUT_V26.onnx models/egcienet_352_multiclass_int8.cache
+bash scripts/engine/build_v26_all_int8_sr_engine.sh
+bash scripts/profiling/benchmark_v26_all_int8_sr_engine.sh
 bash scripts/engine/build_v17_block3_attn_q_matmul_qdq_engine.sh
 bash scripts/profiling/benchmark_v17_block3_attn_q_matmul_qdq_engine.sh
 bash scripts/pipeline/run_server.sh

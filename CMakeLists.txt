@@ -11,14 +11,18 @@ option(EGCINET_BUILD_INT8_CALIBRATOR "Build the INT8 calibration cache tool" OFF
 option(
     EGCINET_BUILD_BLOCK1_FUSED_PLUGIN
     "Build the experimental block1 DWConv + GELU TensorRT plugin"
-    ON
+    OFF
 )
 option(
     EGCINET_BUILD_PACKED_DWCONV_PLUGIN
     "Build the packed-weight DWConv + GELU TensorRT plugin"
     OFF
 )
-
+option(
+    EGCINET_BUILD_FUSED_SR_PLUGIN
+    "Build the fused spatial-reduction TensorRT plugin"
+    OFF
+)
 find_package(CUDAToolkit REQUIRED)
 if(EGCINET_BUILD_PIPELINE OR EGCINET_BUILD_INT8_CALIBRATOR)
     find_package(OpenCV REQUIRED)
@@ -155,7 +159,7 @@ endif()
 
 # Pipeline 和自定义插件都包含 .cu 文件，仅在确实需要时启用 CUDA 语言。
 if(EGCINET_BUILD_PIPELINE OR EGCINET_BUILD_BLOCK1_FUSED_PLUGIN OR
-   EGCINET_BUILD_PACKED_DWCONV_PLUGIN)
+   EGCINET_BUILD_PACKED_DWCONV_PLUGIN OR EGCINET_BUILD_FUSED_SR_PLUGIN)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -189,6 +193,35 @@ if(EGCINET_BUILD_PACKED_DWCONV_PLUGIN)
         POSITION_INDEPENDENT_CODE ON
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
         OUTPUT_NAME egcinet_packed_dwconv_plugin
+    )
+endif()
+
+# Attention SR plugin：FP16 路径用 cuBLASLt GEMM+bias；Block3 INT8 路径
+# 复用 Q 投影的量化输入，用 INT8 IMMA/INT32 累加并在转置 epilogue 中完成
+# per-channel 反量化与 bias。与 Packed DWConv 独立成库，便于加载和回退。
+if(EGCINET_BUILD_FUSED_SR_PLUGIN)
+    add_library(egcinet_fused_sr_plugin SHARED
+        src/plugins/FusedSpatialReductionKernel.cu
+        src/plugins/FusedSpatialReductionPlugin.cpp
+    )
+
+    target_include_directories(egcinet_fused_sr_plugin PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${TENSORRT_INCLUDE_DIR}
+    )
+
+    target_link_libraries(egcinet_fused_sr_plugin PRIVATE
+        ${TENSORRT_NVINFER_LIB}
+        CUDA::cudart
+        CUDA::cublasLt
+    )
+
+    set_target_properties(egcinet_fused_sr_plugin PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+        OUTPUT_NAME egcinet_fused_sr_plugin
     )
 endif()
 
