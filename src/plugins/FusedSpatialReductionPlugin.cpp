@@ -1,7 +1,5 @@
 #include "plugins/FusedSpatialReductionPlugin.h"
 
-#include <cublasLt.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
 #include <cmath>
@@ -10,28 +8,19 @@
 #include <new>
 #include <stdexcept>
 #include <string_view>
-#include <utility>
 
 namespace egcinet::plugins {
 
-int32_t launchPackSpatialReductionWindows(
+int32_t launchFusedInt8SpatialReduction(
     int32_t stage,
     int32_t int8Mode,
     bool floatInput,
     float activationScale,
     const void* input,
-    void* packedInput,
-    cudaStream_t stream
-) noexcept;
-
-int32_t launchDequantizeSpatialReductionOutput(
-    const void* accumulator,
+    const void* weight,
     const void* bias,
     const void* dequantScale,
     void* output,
-    int32_t outputTokens,
-    int32_t outputChannels,
-    int32_t accumulatorTokens,
     cudaStream_t stream
 ) noexcept;
 
@@ -39,15 +28,11 @@ namespace {
 
 constexpr int32_t kSuccess = 0;
 constexpr int32_t kFailure = -1;
-constexpr char kFp16InputLayout[] = "BNC_FP16";
 constexpr char kInt8InputLayout[] = "BNC_INT8";
 constexpr char kFusedQuantizeInputLayout[] = "BNC_FP_PACK_INT8";
 constexpr char kOutputLayout[] = "BNC_FP16";
-constexpr char kFp16PackedWeightLayout[] =
-    "KHKW_CI_CO_ROW_MAJOR_FP16";
 constexpr char kInt8PackedWeightLayout[] =
     "CO_KHKW_CI_ROW_MAJOR_INT8";
-constexpr int32_t kInt8GemmTokens = 128;
 
 bool isSupportedParameters(
     const FusedSpatialReductionParameters& parameters
@@ -59,7 +44,7 @@ bool isSupportedParameters(
         parameters.packedK !=
             parameters.kernelHeight * parameters.kernelWidth *
             parameters.inputChannels ||
-        parameters.layerIndex < 0 || parameters.int8Mode < 0 ||
+        parameters.layerIndex < 0 || parameters.int8Mode < 1 ||
         parameters.int8Mode > 2 ||
         (parameters.int8Mode == 2 &&
          (!std::isfinite(parameters.activationScale) ||
@@ -69,7 +54,8 @@ bool isSupportedParameters(
 
     switch (parameters.stage) {
     case 1:
-        return parameters.inputHeight == 88 &&
+        return parameters.int8Mode == 2 &&
+               parameters.inputHeight == 88 &&
                parameters.inputWidth == 88 &&
                parameters.inputChannels == 64 &&
                parameters.kernelHeight == 8 &&
@@ -78,7 +64,8 @@ bool isSupportedParameters(
                parameters.strideWidth == 8 &&
                parameters.packedK == 4096;
     case 2:
-        return parameters.inputHeight == 44 &&
+        return parameters.int8Mode == 1 &&
+               parameters.inputHeight == 44 &&
                parameters.inputWidth == 44 &&
                parameters.inputChannels == 128 &&
                parameters.kernelHeight == 4 &&
@@ -87,7 +74,8 @@ bool isSupportedParameters(
                parameters.strideWidth == 4 &&
                parameters.packedK == 2048;
     case 3:
-        return parameters.inputHeight == 22 &&
+        return parameters.int8Mode == 1 &&
+               parameters.inputHeight == 22 &&
                parameters.inputWidth == 22 &&
                parameters.inputChannels == 320 &&
                parameters.kernelHeight == 2 &&
@@ -182,289 +170,7 @@ bool readString(
     return true;
 }
 
-void checkCublas(cublasStatus_t status, const char* operation) {
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(
-            std::string(operation) + " failed with cuBLAS status " +
-            std::to_string(static_cast<int32_t>(status))
-        );
-    }
-}
-
 } // namespace
-
-struct FusedSpatialReductionRuntime {
-    explicit FusedSpatialReductionRuntime(
-        const FusedSpatialReductionParameters& parameters
-    )
-        : int8Mode(parameters.int8Mode != 0) {
-        // FP16 继续用等价的 column-major NN 解释。INT8 IMMA 的普通布局
-        // 只支持 TN，因此把 M 补齐到 128：packed input 解释为 [K,M]，
-        // 离线转置的 weight 解释为 [K,N]，INT32 输出为 [M,N] column-major。
-        const uint64_t m = static_cast<uint64_t>(
-            int8Mode
-                ? kInt8GemmTokens
-                : parameters.outputHeight * parameters.outputWidth
-        );
-        const uint64_t k = static_cast<uint64_t>(parameters.packedK);
-        const uint64_t n = static_cast<uint64_t>(parameters.packedN);
-
-        checkCublas(cublasLtCreate(&handle), "cublasLtCreate");
-        try {
-            checkCublas(
-                cublasLtMatmulDescCreate(
-                    &operation,
-                    int8Mode ? CUBLAS_COMPUTE_32I : CUBLAS_COMPUTE_32F,
-                    int8Mode ? CUDA_R_32I : CUDA_R_32F
-                ),
-                "cublasLtMatmulDescCreate"
-            );
-            if (!int8Mode) {
-                const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
-                checkCublas(
-                    cublasLtMatmulDescSetAttribute(
-                        operation,
-                        CUBLASLT_MATMUL_DESC_EPILOGUE,
-                        &epilogue,
-                        sizeof(epilogue)
-                    ),
-                    "set cuBLASLt bias epilogue"
-                );
-            } else {
-                const cublasOperation_t transposeInput = CUBLAS_OP_T;
-                checkCublas(
-                    cublasLtMatmulDescSetAttribute(
-                        operation,
-                        CUBLASLT_MATMUL_DESC_TRANSA,
-                        &transposeInput,
-                        sizeof(transposeInput)
-                    ),
-                    "set cuBLASLt INT8 input transpose"
-                );
-            }
-
-            checkCublas(
-                cublasLtMatrixLayoutCreate(
-                    &weightLayout,
-                    int8Mode ? CUDA_R_8I : CUDA_R_16F,
-                    int8Mode ? k : n,
-                    int8Mode ? n : k,
-                    static_cast<int64_t>(int8Mode ? k : n)
-                ),
-                "create cuBLASLt weight layout"
-            );
-            checkCublas(
-                cublasLtMatrixLayoutCreate(
-                    &inputLayout,
-                    int8Mode ? CUDA_R_8I : CUDA_R_16F,
-                    k,
-                    m,
-                    static_cast<int64_t>(k)
-                ),
-                "create cuBLASLt input layout"
-            );
-            checkCublas(
-                cublasLtMatrixLayoutCreate(
-                    &outputLayout,
-                    int8Mode ? CUDA_R_32I : CUDA_R_16F,
-                    int8Mode ? m : n,
-                    int8Mode ? n : m,
-                    static_cast<int64_t>(int8Mode ? m : n)
-                ),
-                "create cuBLASLt output layout"
-            );
-
-            cublasLtMatmulPreference_t preference = nullptr;
-            checkCublas(
-                cublasLtMatmulPreferenceCreate(&preference),
-                "cublasLtMatmulPreferenceCreate"
-            );
-            try {
-                const size_t maximumWorkspaceBytes = 0;
-                checkCublas(
-                    cublasLtMatmulPreferenceSetAttribute(
-                        preference,
-                        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                        &maximumWorkspaceBytes,
-                        sizeof(maximumWorkspaceBytes)
-                    ),
-                    "set cuBLASLt workspace preference"
-                );
-
-                if (!int8Mode) {
-                    // Heuristic 只读取指针对齐，不会解引用 bias。实际
-                    // enqueue 前会用本次网络输入的设备地址覆盖它。
-                    const void* alignedBiasPlaceholder =
-                        reinterpret_cast<const void*>(256U);
-                    checkCublas(
-                        cublasLtMatmulDescSetAttribute(
-                            operation,
-                            CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-                            &alignedBiasPlaceholder,
-                            sizeof(alignedBiasPlaceholder)
-                        ),
-                        "set cuBLASLt heuristic bias pointer"
-                    );
-                }
-
-                cublasLtMatmulHeuristicResult_t heuristic{};
-                int32_t returnedResults = 0;
-                checkCublas(
-                    cublasLtMatmulAlgoGetHeuristic(
-                        handle,
-                        operation,
-                        int8Mode ? inputLayout : weightLayout,
-                        int8Mode ? weightLayout : inputLayout,
-                        outputLayout,
-                        outputLayout,
-                        preference,
-                        1,
-                        &heuristic,
-                        &returnedResults
-                    ),
-                    "cublasLtMatmulAlgoGetHeuristic"
-                );
-                if (returnedResults != 1 ||
-                    heuristic.state != CUBLAS_STATUS_SUCCESS ||
-                    heuristic.workspaceSize != 0) {
-                    throw std::runtime_error(
-                        int8Mode
-                            ? "no zero-workspace cuBLASLt INT8 SR algorithm"
-                            : "no zero-workspace cuBLASLt FP16 SR algorithm"
-                    );
-                }
-                algorithm = heuristic.algo;
-                algorithmReady = true;
-            } catch (...) {
-                cublasLtMatmulPreferenceDestroy(preference);
-                throw;
-            }
-            checkCublas(
-                cublasLtMatmulPreferenceDestroy(preference),
-                "cublasLtMatmulPreferenceDestroy"
-            );
-        } catch (...) {
-            reset();
-            throw;
-        }
-    }
-
-    ~FusedSpatialReductionRuntime() noexcept {
-        reset();
-    }
-
-    FusedSpatialReductionRuntime(
-        const FusedSpatialReductionRuntime&
-    ) = delete;
-    FusedSpatialReductionRuntime& operator=(
-        const FusedSpatialReductionRuntime&
-    ) = delete;
-
-    int32_t matmul(
-        const void* packedInput,
-        const void* weight,
-        const void* bias,
-        void* output,
-        cudaStream_t stream
-    ) noexcept {
-        if (!algorithmReady || packedInput == nullptr || weight == nullptr ||
-            bias == nullptr || output == nullptr) {
-            return kFailure;
-        }
-
-        if (int8Mode) {
-            constexpr int32_t alpha = 1;
-            constexpr int32_t beta = 0;
-            return cublasLtMatmul(
-                       handle,
-                       operation,
-                       &alpha,
-                       packedInput,
-                       inputLayout,
-                       weight,
-                       weightLayout,
-                       &beta,
-                       output,
-                       outputLayout,
-                       output,
-                       outputLayout,
-                       &algorithm,
-                       nullptr,
-                       0,
-                       stream
-                   ) == CUBLAS_STATUS_SUCCESS
-                ? kSuccess
-                : kFailure;
-        }
-
-        const void* biasPointer = bias;
-        if (cublasLtMatmulDescSetAttribute(
-                operation,
-                CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-                &biasPointer,
-                sizeof(biasPointer)
-            ) != CUBLAS_STATUS_SUCCESS) {
-            return kFailure;
-        }
-
-        constexpr float alpha = 1.0F;
-        constexpr float beta = 0.0F;
-        return cublasLtMatmul(
-                   handle,
-                   operation,
-                   &alpha,
-                   weight,
-                   weightLayout,
-                   packedInput,
-                   inputLayout,
-                   &beta,
-                   output,
-                   outputLayout,
-                   output,
-                   outputLayout,
-                   &algorithm,
-                   nullptr,
-                   0,
-                   stream
-               ) == CUBLAS_STATUS_SUCCESS
-            ? kSuccess
-            : kFailure;
-    }
-
-private:
-    void reset() noexcept {
-        if (outputLayout != nullptr) {
-            cublasLtMatrixLayoutDestroy(outputLayout);
-            outputLayout = nullptr;
-        }
-        if (inputLayout != nullptr) {
-            cublasLtMatrixLayoutDestroy(inputLayout);
-            inputLayout = nullptr;
-        }
-        if (weightLayout != nullptr) {
-            cublasLtMatrixLayoutDestroy(weightLayout);
-            weightLayout = nullptr;
-        }
-        if (operation != nullptr) {
-            cublasLtMatmulDescDestroy(operation);
-            operation = nullptr;
-        }
-        if (handle != nullptr) {
-            cublasLtDestroy(handle);
-            handle = nullptr;
-        }
-        algorithmReady = false;
-    }
-
-    cublasLtHandle_t handle = nullptr;
-    cublasLtMatmulDesc_t operation = nullptr;
-    cublasLtMatrixLayout_t weightLayout = nullptr;
-    cublasLtMatrixLayout_t inputLayout = nullptr;
-    cublasLtMatrixLayout_t outputLayout = nullptr;
-    cublasLtMatmulAlgo_t algorithm{};
-    bool algorithmReady = false;
-    bool int8Mode = false;
-};
 
 FusedSpatialReductionPlugin::FusedSpatialReductionPlugin(
     FusedSpatialReductionParameters parameters
@@ -475,7 +181,6 @@ FusedSpatialReductionPlugin::FusedSpatialReductionPlugin(
             "unsupported fused spatial reduction parameters"
         );
     }
-    runtime_ = std::make_unique<FusedSpatialReductionRuntime>(parameters_);
 }
 
 FusedSpatialReductionPlugin::~FusedSpatialReductionPlugin() noexcept = default;
@@ -552,25 +257,18 @@ int32_t FusedSpatialReductionPlugin::getOutputDataTypes(
     const nvinfer1::DataType* inputTypes,
     int32_t nbInputs
 ) const noexcept {
-    const int32_t expectedInputs = parameters_.int8Mode != 0 ? 4 : 3;
+    constexpr int32_t expectedInputs = 4;
     if (outputTypes == nullptr || inputTypes == nullptr || nbOutputs != 1 ||
         nbInputs != expectedInputs) {
         return kFailure;
     }
-    if (parameters_.int8Mode != 0) {
-        const bool inputTypeValid = parameters_.int8Mode == 1
-            ? inputTypes[0] == nvinfer1::DataType::kINT8
-            : inputTypes[0] == nvinfer1::DataType::kHALF ||
-                  inputTypes[0] == nvinfer1::DataType::kFLOAT;
-        if (!inputTypeValid ||
-            inputTypes[1] != nvinfer1::DataType::kINT8 ||
-            inputTypes[2] != nvinfer1::DataType::kHALF ||
-            inputTypes[3] != nvinfer1::DataType::kFLOAT) {
-            return kFailure;
-        }
-    } else if (inputTypes[0] != nvinfer1::DataType::kHALF ||
-               inputTypes[1] != nvinfer1::DataType::kHALF ||
-               inputTypes[2] != nvinfer1::DataType::kHALF) {
+    const bool inputTypeValid = parameters_.int8Mode == 1
+        ? inputTypes[0] == nvinfer1::DataType::kINT8
+        : inputTypes[0] == nvinfer1::DataType::kHALF ||
+              inputTypes[0] == nvinfer1::DataType::kFLOAT;
+    if (!inputTypeValid || inputTypes[1] != nvinfer1::DataType::kINT8 ||
+        inputTypes[2] != nvinfer1::DataType::kHALF ||
+        inputTypes[3] != nvinfer1::DataType::kFLOAT) {
         return kFailure;
     }
     outputTypes[0] = nvinfer1::DataType::kHALF;
@@ -586,11 +284,11 @@ int32_t FusedSpatialReductionPlugin::getOutputShapes(
     int32_t nbOutputs,
     nvinfer1::IExprBuilder& exprBuilder
 ) noexcept {
-    const int32_t expectedInputs = parameters_.int8Mode != 0 ? 4 : 3;
+    constexpr int32_t expectedInputs = 4;
     if (inputs == nullptr || outputs == nullptr || nbInputs != expectedInputs ||
         nbOutputs != 1 || nbShapeInputs != 0 || inputs[0].nbDims != 3 ||
         inputs[1].nbDims != 2 || inputs[2].nbDims != 1 ||
-        (parameters_.int8Mode != 0 && inputs[3].nbDims != 1)) {
+        inputs[3].nbDims != 1) {
         return kFailure;
     }
     outputs[0].nbDims = 3;
@@ -608,14 +306,11 @@ bool FusedSpatialReductionPlugin::supportsFormatCombination(
     int32_t nbInputs,
     int32_t nbOutputs
 ) noexcept {
-    const int32_t expectedInputs = parameters_.int8Mode != 0 ? 4 : 3;
+    constexpr int32_t expectedInputs = 4;
     if (inOut == nullptr || nbInputs != expectedInputs || nbOutputs != 1 ||
         pos < 0 ||
         pos >= nbInputs + nbOutputs) {
         return false;
-    }
-    if (parameters_.int8Mode == 0) {
-        return isHalfLinear(inOut[pos].desc);
     }
     switch (pos) {
     case 0:
@@ -641,23 +336,20 @@ bool FusedSpatialReductionPlugin::validateDescriptors(
     int32_t nbOutputs,
     bool allowDynamic
 ) const noexcept {
-    const int32_t expectedInputs = parameters_.int8Mode != 0 ? 4 : 3;
+    constexpr int32_t expectedInputs = 4;
     if (inputs == nullptr || outputs == nullptr ||
         nbInputs != expectedInputs ||
-        nbOutputs != 1 || runtime_ == nullptr ||
+        nbOutputs != 1 ||
         inputs[0].dims.nbDims != 3 || inputs[1].dims.nbDims != 2 ||
         inputs[2].dims.nbDims != 1 || outputs[0].dims.nbDims != 3 ||
-        (parameters_.int8Mode != 0 && inputs[3].dims.nbDims != 1)) {
+        inputs[3].dims.nbDims != 1) {
         return false;
     }
     const bool int8InputValid = parameters_.int8Mode == 1
         ? isInt8Linear(inputs[0])
         : isHalfOrFloatLinear(inputs[0]);
-    const bool formatsValid = parameters_.int8Mode != 0
-        ? int8InputValid && isInt8Linear(inputs[1]) &&
-              isHalfLinear(inputs[2]) && isFloatLinear(inputs[3])
-        : isHalfLinear(inputs[0]) && isHalfLinear(inputs[1]) &&
-              isHalfLinear(inputs[2]);
+    const bool formatsValid = int8InputValid && isInt8Linear(inputs[1]) &&
+        isHalfLinear(inputs[2]) && isFloatLinear(inputs[3]);
     if (!formatsValid || !isHalfLinear(outputs[0])) {
         return false;
     }
@@ -674,25 +366,20 @@ bool FusedSpatialReductionPlugin::validateDescriptors(
         ) &&
         matchesDimension(
             inputs[1].dims.d[0],
-            parameters_.int8Mode != 0
-                ? parameters_.packedN
-                : parameters_.packedK,
+            parameters_.packedN,
             allowDynamic
         ) &&
         matchesDimension(
             inputs[1].dims.d[1],
-            parameters_.int8Mode != 0
-                ? parameters_.packedK
-                : parameters_.packedN,
+            parameters_.packedK,
             allowDynamic
         ) &&
         matchesDimension(
             inputs[2].dims.d[0], parameters_.packedN, allowDynamic
         ) &&
-        (parameters_.int8Mode == 0 ||
-         matchesDimension(
-             inputs[3].dims.d[0], parameters_.packedN, allowDynamic
-         )) &&
+        matchesDimension(
+            inputs[3].dims.d[0], parameters_.packedN, allowDynamic
+        ) &&
         matchesDimension(outputs[0].dims.d[0], 1, allowDynamic) &&
         matchesDimension(
             outputs[0].dims.d[1],
@@ -719,7 +406,7 @@ int32_t FusedSpatialReductionPlugin::configurePlugin(
         inputs[2].desc,
         {},
     };
-    if (parameters_.int8Mode != 0 && nbInputs == 4) {
+    if (nbInputs == 4) {
         inputDescriptors[3] = inputs[3].desc;
     }
     return validateDescriptors(
@@ -750,24 +437,9 @@ size_t FusedSpatialReductionPlugin::getWorkspaceSize(
     const nvinfer1::DynamicPluginTensorDesc* /* outputs */,
     int32_t nbOutputs
 ) const noexcept {
-    const int32_t expectedInputs = parameters_.int8Mode != 0 ? 4 : 3;
-    if (nbInputs != expectedInputs || nbOutputs != 1) {
-        return 0;
-    }
-    const size_t spatialOutputTokens =
-        static_cast<size_t>(parameters_.outputHeight) *
-        static_cast<size_t>(parameters_.outputWidth);
-    const size_t gemmTokens = parameters_.int8Mode != 0
-        ? static_cast<size_t>(kInt8GemmTokens)
-        : spatialOutputTokens;
-    const size_t packedBytes = gemmTokens *
-        static_cast<size_t>(parameters_.packedK) *
-        (parameters_.int8Mode != 0 ? sizeof(int8_t) : sizeof(half));
-    const size_t accumulatorBytes = parameters_.int8Mode != 0
-        ? gemmTokens * static_cast<size_t>(parameters_.packedN) *
-              sizeof(int32_t)
-        : 0;
-    return packedBytes + accumulatorBytes;
+    (void)nbInputs;
+    (void)nbOutputs;
+    return 0;
 }
 
 int32_t FusedSpatialReductionPlugin::enqueue(
@@ -775,64 +447,30 @@ int32_t FusedSpatialReductionPlugin::enqueue(
     const nvinfer1::PluginTensorDesc* outputDesc,
     const void* const* inputs,
     void* const* outputs,
-    void* workspace,
+    void* /* workspace */,
     cudaStream_t stream
 ) noexcept {
-    const int32_t expectedInputs = parameters_.int8Mode != 0 ? 4 : 3;
+    constexpr int32_t expectedInputs = 4;
     if (!validateDescriptors(
             inputDesc, expectedInputs, outputDesc, 1, false
         ) ||
-        inputs == nullptr || outputs == nullptr || workspace == nullptr ||
+        inputs == nullptr || outputs == nullptr ||
         inputs[0] == nullptr || inputs[1] == nullptr || inputs[2] == nullptr ||
-        (parameters_.int8Mode != 0 && inputs[3] == nullptr) ||
+        inputs[3] == nullptr ||
         outputs[0] == nullptr) {
         return kFailure;
     }
 
-    if (launchPackSpatialReductionWindows(
-            parameters_.stage,
-            parameters_.int8Mode,
-            inputDesc[0].type == nvinfer1::DataType::kFLOAT,
-            parameters_.activationScale,
-            inputs[0],
-            workspace,
-            stream
-        ) != kSuccess) {
-        return kFailure;
-    }
-    if (parameters_.int8Mode == 0) {
-        return runtime_->matmul(
-            workspace,
-            inputs[1],
-            inputs[2],
-            outputs[0],
-            stream
-        );
-    }
-
-    const size_t outputTokens =
-        static_cast<size_t>(parameters_.outputHeight) *
-        static_cast<size_t>(parameters_.outputWidth);
-    const size_t packedBytes = static_cast<size_t>(kInt8GemmTokens) *
-        static_cast<size_t>(parameters_.packedK) * sizeof(int8_t);
-    auto* accumulator = static_cast<unsigned char*>(workspace) + packedBytes;
-    if (runtime_->matmul(
-            workspace,
-            inputs[1],
-            inputs[2],
-            accumulator,
-            stream
-        ) != kSuccess) {
-        return kFailure;
-    }
-    return launchDequantizeSpatialReductionOutput(
-        accumulator,
+    return launchFusedInt8SpatialReduction(
+        parameters_.stage,
+        parameters_.int8Mode,
+        inputDesc[0].type == nvinfer1::DataType::kFLOAT,
+        parameters_.activationScale,
+        inputs[0],
+        inputs[1],
         inputs[2],
         inputs[3],
         outputs[0],
-        static_cast<int32_t>(outputTokens),
-        parameters_.outputChannels,
-        kInt8GemmTokens,
         stream
     );
 }
@@ -875,14 +513,9 @@ FusedSpatialReductionPlugin::getFieldsToSerialize() noexcept {
             nvinfer1::PluginFieldType::kFLOAT32,
             1
         );
-        const char* inputLayout = parameters_.int8Mode == 0
-            ? kFp16InputLayout
-            : parameters_.int8Mode == 1
-                ? kInt8InputLayout
-                : kFusedQuantizeInputLayout;
-        const char* weightLayout = parameters_.int8Mode != 0
-            ? kInt8PackedWeightLayout
-            : kFp16PackedWeightLayout;
+        const char* inputLayout = parameters_.int8Mode == 1
+            ? kInt8InputLayout
+            : kFusedQuantizeInputLayout;
         serializedFields_.emplace_back(
             "input_layout",
             inputLayout,
@@ -897,9 +530,11 @@ FusedSpatialReductionPlugin::getFieldsToSerialize() noexcept {
         );
         serializedFields_.emplace_back(
             "packed_weight_layout",
-            weightLayout,
+            kInt8PackedWeightLayout,
             nvinfer1::PluginFieldType::kCHAR,
-            static_cast<int32_t>(std::string_view(weightLayout).size())
+            static_cast<int32_t>(
+                std::string_view(kInt8PackedWeightLayout).size()
+            )
         );
         serializedFieldCollection_.nbFields =
             static_cast<int32_t>(serializedFields_.size());
@@ -1076,18 +711,14 @@ nvinfer1::IPluginV3* FusedSpatialReductionPluginCreator::createPlugin(
         }
 
         constexpr uint32_t kRequiredIntegerFields = (1U << 16) - 1U;
-        const char* expectedInputLayout = parameters.int8Mode == 0
-            ? kFp16InputLayout
-            : parameters.int8Mode == 1
-                ? kInt8InputLayout
-                : kFusedQuantizeInputLayout;
-        const char* expectedWeightLayout = parameters.int8Mode != 0
-            ? kInt8PackedWeightLayout
-            : kFp16PackedWeightLayout;
+        const char* expectedInputLayout = parameters.int8Mode == 1
+            ? kInt8InputLayout
+            : kFusedQuantizeInputLayout;
         if ((seen & kRequiredIntegerFields) != kRequiredIntegerFields ||
             (!inputLayout.empty() && inputLayout != expectedInputLayout) ||
             (!outputLayout.empty() && outputLayout != kOutputLayout) ||
-            (!weightLayout.empty() && weightLayout != expectedWeightLayout)) {
+            (!weightLayout.empty() &&
+             weightLayout != kInt8PackedWeightLayout)) {
             return nullptr;
         }
 

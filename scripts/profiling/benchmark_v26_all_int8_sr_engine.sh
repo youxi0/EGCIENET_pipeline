@@ -14,6 +14,7 @@ WARMUP_MS="${WARMUP_MS:-1000}"
 DURATION_SECONDS="${DURATION_SECONDS:-10}"
 ITERATIONS="${ITERATIONS:-10}"
 PROFILE_JSON="${PROFILE_JSON:-${PROJECT_ROOT}/results/profile/v26_all_int8_sr_profile.json}"
+BENCHMARK_LABEL="${BENCHMARK_LABEL:-V26 all-stage INT8 spatial-reduction}"
 
 TRTEXEC=$(resolve_trtexec)
 
@@ -27,7 +28,7 @@ done
 configure_tensorrt_library_path
 mkdir -p "$(dirname "${PROFILE_JSON}")"
 
-echo "[INFO] benchmark V26 all-stage INT8 spatial-reduction engine"
+echo "[INFO] benchmark ${BENCHMARK_LABEL} engine"
 "${TRTEXEC}" \
     "--loadEngine=${ENGINE}" \
     "--staticPlugins=${PACKED_DWCONV_SO}" \

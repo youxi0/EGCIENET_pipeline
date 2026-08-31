@@ -146,8 +146,8 @@ def main() -> None:
                 f"model.rgb_encoder.block3.{block_index}.attn.sr.weight."
                 "V25_KHKWCI_CO_INT8"
             ),
-            # cuBLASLt 的普通 INT8 IMMA 路径只支持 TN。转成连续 [N,K]
-            # 后可直接按 column-major [K,N] 使用，不需要运行时重排。
+            # 插件按输出通道读取连续 K，因此离线转成连续 [N,K]，运行时
+            # 可以直接异步搬入 Tensor Core MMA 的 shared-memory tile。
             values=np.ascontiguousarray(quantized_weight.T),
         )
         accumulator_scale_tensor = gs.Constant(

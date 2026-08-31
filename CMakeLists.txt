@@ -196,9 +196,9 @@ if(EGCINET_BUILD_PACKED_DWCONV_PLUGIN)
     )
 endif()
 
-# Attention SR plugin：FP16 路径用 cuBLASLt GEMM+bias；Block3 INT8 路径
-# 复用 Q 投影的量化输入，用 INT8 IMMA/INT32 累加并在转置 epilogue 中完成
-# per-channel 反量化与 bias。与 Packed DWConv 独立成库，便于加载和回退。
+# Attention SR plugin：直接融合窗口读取、INT8 Tensor Core MMA、per-channel
+# 反量化和 bias；Block1 还在窗口读取时融合 FP16/FP32 到 INT8 的量化。
+# 与 Packed DWConv 独立成库，三个 SR stage 共用一套模板化 kernel。
 if(EGCINET_BUILD_FUSED_SR_PLUGIN)
     add_library(egcinet_fused_sr_plugin SHARED
         src/plugins/FusedSpatialReductionKernel.cu
@@ -213,7 +213,6 @@ if(EGCINET_BUILD_FUSED_SR_PLUGIN)
     target_link_libraries(egcinet_fused_sr_plugin PRIVATE
         ${TENSORRT_NVINFER_LIB}
         CUDA::cudart
-        CUDA::cublasLt
     )
 
     set_target_properties(egcinet_fused_sr_plugin PROPERTIES

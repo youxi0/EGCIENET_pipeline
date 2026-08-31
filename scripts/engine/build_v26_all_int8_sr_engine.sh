@@ -16,6 +16,7 @@ WORKSPACE_MIB="${WORKSPACE_MIB:-256}"
 TIMING_CACHE="${TIMING_CACHE:-${PROJECT_ROOT}/models/egcienet_352_multiclass_qdq_v13_v14.timing.cache}"
 TRT_TEMP_DIR="${TRT_TEMP_DIR:-${BUILD_DIR}/tensorrt_tmp}"
 LAYER_INFO="${LAYER_INFO:-${ENGINE%.engine}_layers.json}"
+BUILD_LABEL="${BUILD_LABEL:-V26 all-stage INT8 spatial-reduction}"
 
 TRTEXEC=$(resolve_trtexec)
 
@@ -30,7 +31,7 @@ configure_tensorrt_library_path
 mkdir -p "$(dirname "${ENGINE}")" "$(dirname "${LAYER_INFO}")"
 mkdir -p "$(dirname "${TIMING_CACHE}")" "${TRT_TEMP_DIR}"
 
-echo "[INFO] build V26 all-stage INT8 spatial-reduction engine"
+echo "[INFO] build ${BUILD_LABEL} engine"
 echo "[INFO] onnx: ${ONNX}"
 echo "[INFO] engine: ${ENGINE}"
 
@@ -58,5 +59,5 @@ for output_file in "${ENGINE}" "${LAYER_INFO}"; do
     fi
 done
 
-echo "[PASS] V26 engine: ${ENGINE}"
+echo "[PASS] ${BUILD_LABEL} engine: ${ENGINE}"
 echo "[PASS] layer info: ${LAYER_INFO}"

@@ -8,7 +8,6 @@
 #endif
 
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -40,17 +39,13 @@ struct FusedSpatialReductionParameters {
     float activationScale = 0.0F;
 };
 
-struct FusedSpatialReductionRuntime;
-
-// TensorRT V3 plugin，支持三种静态接口：
-//   FP16: input[0] BNC FP16, input[1] FP16 weight [K,N],
-//         input[2] FP16 bias [N].
+// TensorRT V3 plugin，支持当前全 INT8 SR engine 的两种静态接口：
 //   INT8: input[0] BNC INT8, input[1] INT8 weight [N,K],
 //         input[2] FP16 bias [N], input[3] FP32 dequant scale [N].
 //   Fused-Q INT8: 与 INT8 路径接口相同，但 input[0] 为 FP16/FP32；
-//         window pack 在重排过程中按 activationScale 直接量化为 INT8。
-// INT8 的 scale 已在构图时合并为 activation_scale * weight_scale[N]，
-// GEMM 使用 INT32 累加。两条路径都输出 token-major BNC FP16。
+//         mainloop 在构造窗口时按 activationScale 直接量化为 INT8。
+// scale 已在构图时合并为 activation_scale * weight_scale[N]。插件直接
+// 融合窗口读取、INT8 Tensor Core GEMM、反量化和 bias，不申请 workspace。
 class FusedSpatialReductionPlugin final
     : public nvinfer1::IPluginV3,
       public nvinfer1::IPluginV3OneCore,
@@ -136,7 +131,6 @@ private:
 
     FusedSpatialReductionParameters parameters_{};
     std::string namespace_ = kFusedSpatialReductionPluginNamespace;
-    std::unique_ptr<FusedSpatialReductionRuntime> runtime_;
     std::vector<nvinfer1::PluginField> serializedFields_;
     nvinfer1::PluginFieldCollection serializedFieldCollection_{};
 };
