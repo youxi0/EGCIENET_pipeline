@@ -198,10 +198,12 @@ endif()
 
 # Attention SR plugin：直接融合窗口读取、INT8 Tensor Core MMA、per-channel
 # 反量化和 bias；Block1 还在窗口读取时融合 FP16/FP32 到 INT8 的量化。
-# 与 Packed DWConv 独立成库，三个 SR stage 共用一套模板化 kernel。
+# 与 Packed DWConv 独立成库；三个 SR stage 和 DWConv 一样分别实现和维护。
 if(EGCINET_BUILD_FUSED_SR_PLUGIN)
     add_library(egcinet_fused_sr_plugin SHARED
-        src/plugins/FusedSpatialReductionKernel.cu
+        src/plugins/Block1FusedSpatialReductionKernel.cu
+        src/plugins/Block2FusedSpatialReductionKernel.cu
+        src/plugins/Block3FusedSpatialReductionKernel.cu
         src/plugins/FusedSpatialReductionPlugin.cpp
     )
 

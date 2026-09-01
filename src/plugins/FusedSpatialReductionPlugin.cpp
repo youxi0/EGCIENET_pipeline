@@ -11,11 +11,27 @@
 
 namespace egcinet::plugins {
 
-int32_t launchFusedInt8SpatialReduction(
-    int32_t stage,
-    int32_t int8Mode,
+int32_t launchBlock1FusedSpatialReduction(
     bool floatInput,
     float activationScale,
+    const void* input,
+    const void* weight,
+    const void* bias,
+    const void* dequantScale,
+    void* output,
+    cudaStream_t stream
+) noexcept;
+
+int32_t launchBlock2FusedSpatialReduction(
+    const void* input,
+    const void* weight,
+    const void* bias,
+    const void* dequantScale,
+    void* output,
+    cudaStream_t stream
+) noexcept;
+
+int32_t launchBlock3FusedSpatialReduction(
     const void* input,
     const void* weight,
     const void* bias,
@@ -33,6 +49,49 @@ constexpr char kFusedQuantizeInputLayout[] = "BNC_FP_PACK_INT8";
 constexpr char kOutputLayout[] = "BNC_FP16";
 constexpr char kInt8PackedWeightLayout[] =
     "CO_KHKW_CI_ROW_MAJOR_INT8";
+
+struct StageSpec {
+    int32_t stage;
+    int32_t int8Mode;
+    int32_t inputExtent;
+    int32_t channels;
+    int32_t kernelExtent;
+    int32_t packedK;
+};
+
+constexpr StageSpec kStageSpecs[] = {
+    {1, 2, 88, 64, 8, 4096},
+    {2, 1, 44, 128, 4, 2048},
+    {3, 1, 22, 320, 2, 1280},
+};
+
+struct IntegerFieldSpec {
+    const char* name;
+    int32_t FusedSpatialReductionParameters::* member;
+    uint32_t seenBit;
+};
+
+constexpr IntegerFieldSpec kIntegerFieldSpecs[] = {
+    {"stage", &FusedSpatialReductionParameters::stage, 1U << 0},
+    {"layer_index", &FusedSpatialReductionParameters::layerIndex, 1U << 1},
+    {"input_height", &FusedSpatialReductionParameters::inputHeight, 1U << 2},
+    {"input_width", &FusedSpatialReductionParameters::inputWidth, 1U << 3},
+    {"input_channels", &FusedSpatialReductionParameters::inputChannels, 1U << 4},
+    {"output_height", &FusedSpatialReductionParameters::outputHeight, 1U << 5},
+    {"output_width", &FusedSpatialReductionParameters::outputWidth, 1U << 6},
+    {"output_channels", &FusedSpatialReductionParameters::outputChannels, 1U << 7},
+    {"kernel_height", &FusedSpatialReductionParameters::kernelHeight, 1U << 8},
+    {"kernel_width", &FusedSpatialReductionParameters::kernelWidth, 1U << 9},
+    {"stride_height", &FusedSpatialReductionParameters::strideHeight, 1U << 10},
+    {"stride_width", &FusedSpatialReductionParameters::strideWidth, 1U << 11},
+    {"groups", &FusedSpatialReductionParameters::groups, 1U << 12},
+    {"packed_k", &FusedSpatialReductionParameters::packedK, 1U << 13},
+    {"packed_n", &FusedSpatialReductionParameters::packedN, 1U << 14},
+    {"fuse_layernorm", &FusedSpatialReductionParameters::fuseLayerNorm, 1U << 15},
+    {"int8_mode", &FusedSpatialReductionParameters::int8Mode, 1U << 16},
+};
+
+constexpr uint32_t kRequiredIntegerFields = (1U << 17) - 1U;
 
 bool isSupportedParameters(
     const FusedSpatialReductionParameters& parameters
@@ -52,40 +111,20 @@ bool isSupportedParameters(
         return false;
     }
 
-    switch (parameters.stage) {
-    case 1:
-        return parameters.int8Mode == 2 &&
-               parameters.inputHeight == 88 &&
-               parameters.inputWidth == 88 &&
-               parameters.inputChannels == 64 &&
-               parameters.kernelHeight == 8 &&
-               parameters.kernelWidth == 8 &&
-               parameters.strideHeight == 8 &&
-               parameters.strideWidth == 8 &&
-               parameters.packedK == 4096;
-    case 2:
-        return parameters.int8Mode == 1 &&
-               parameters.inputHeight == 44 &&
-               parameters.inputWidth == 44 &&
-               parameters.inputChannels == 128 &&
-               parameters.kernelHeight == 4 &&
-               parameters.kernelWidth == 4 &&
-               parameters.strideHeight == 4 &&
-               parameters.strideWidth == 4 &&
-               parameters.packedK == 2048;
-    case 3:
-        return parameters.int8Mode == 1 &&
-               parameters.inputHeight == 22 &&
-               parameters.inputWidth == 22 &&
-               parameters.inputChannels == 320 &&
-               parameters.kernelHeight == 2 &&
-               parameters.kernelWidth == 2 &&
-               parameters.strideHeight == 2 &&
-               parameters.strideWidth == 2 &&
-               parameters.packedK == 1280;
-    default:
-        return false;
+    for (const StageSpec& spec : kStageSpecs) {
+        if (parameters.stage == spec.stage) {
+            return parameters.int8Mode == spec.int8Mode &&
+                   parameters.inputHeight == spec.inputExtent &&
+                   parameters.inputWidth == spec.inputExtent &&
+                   parameters.inputChannels == spec.channels &&
+                   parameters.kernelHeight == spec.kernelExtent &&
+                   parameters.kernelWidth == spec.kernelExtent &&
+                   parameters.strideHeight == spec.kernelExtent &&
+                   parameters.strideWidth == spec.kernelExtent &&
+                   parameters.packedK == spec.packedK;
+        }
     }
+    return false;
 }
 
 bool isHalfLinear(const nvinfer1::PluginTensorDesc& descriptor) noexcept {
@@ -461,18 +500,39 @@ int32_t FusedSpatialReductionPlugin::enqueue(
         return kFailure;
     }
 
-    return launchFusedInt8SpatialReduction(
-        parameters_.stage,
-        parameters_.int8Mode,
-        inputDesc[0].type == nvinfer1::DataType::kFLOAT,
-        parameters_.activationScale,
-        inputs[0],
-        inputs[1],
-        inputs[2],
-        inputs[3],
-        outputs[0],
-        stream
-    );
+    switch (parameters_.stage) {
+    case 1:
+        return launchBlock1FusedSpatialReduction(
+            inputDesc[0].type == nvinfer1::DataType::kFLOAT,
+            parameters_.activationScale,
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            outputs[0],
+            stream
+        );
+    case 2:
+        return launchBlock2FusedSpatialReduction(
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            outputs[0],
+            stream
+        );
+    case 3:
+        return launchBlock3FusedSpatialReduction(
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            outputs[0],
+            stream
+        );
+    default:
+        return kFailure;
+    }
 }
 
 nvinfer1::IPluginV3* FusedSpatialReductionPlugin::attachToContext(
@@ -490,23 +550,9 @@ FusedSpatialReductionPlugin::getFieldsToSerialize() noexcept {
                 name, value, nvinfer1::PluginFieldType::kINT32, 1
             );
         };
-        addInt("stage", &parameters_.stage);
-        addInt("layer_index", &parameters_.layerIndex);
-        addInt("input_height", &parameters_.inputHeight);
-        addInt("input_width", &parameters_.inputWidth);
-        addInt("input_channels", &parameters_.inputChannels);
-        addInt("output_height", &parameters_.outputHeight);
-        addInt("output_width", &parameters_.outputWidth);
-        addInt("output_channels", &parameters_.outputChannels);
-        addInt("kernel_height", &parameters_.kernelHeight);
-        addInt("kernel_width", &parameters_.kernelWidth);
-        addInt("stride_height", &parameters_.strideHeight);
-        addInt("stride_width", &parameters_.strideWidth);
-        addInt("groups", &parameters_.groups);
-        addInt("packed_k", &parameters_.packedK);
-        addInt("packed_n", &parameters_.packedN);
-        addInt("fuse_layernorm", &parameters_.fuseLayerNorm);
-        addInt("int8_mode", &parameters_.int8Mode);
+        for (const IntegerFieldSpec& spec : kIntegerFieldSpecs) {
+            addInt(spec.name, &(parameters_.*spec.member));
+        }
         serializedFields_.emplace_back(
             "activation_scale",
             &parameters_.activationScale,
@@ -548,28 +594,9 @@ FusedSpatialReductionPlugin::getFieldsToSerialize() noexcept {
 FusedSpatialReductionPluginCreator::
 FusedSpatialReductionPluginCreator() noexcept {
     try {
-        constexpr const char* kIntegerFields[] = {
-            "stage",
-            "layer_index",
-            "input_height",
-            "input_width",
-            "input_channels",
-            "output_height",
-            "output_width",
-            "output_channels",
-            "kernel_height",
-            "kernel_width",
-            "stride_height",
-            "stride_width",
-            "groups",
-            "packed_k",
-            "packed_n",
-            "fuse_layernorm",
-            "int8_mode",
-        };
-        for (const char* name : kIntegerFields) {
+        for (const IntegerFieldSpec& spec : kIntegerFieldSpecs) {
             fields_.emplace_back(
-                name, nullptr, nvinfer1::PluginFieldType::kINT32, 1
+                spec.name, nullptr, nvinfer1::PluginFieldType::kINT32, 1
             );
         }
         fields_.emplace_back(
@@ -648,50 +675,22 @@ nvinfer1::IPluginV3* FusedSpatialReductionPluginCreator::createPlugin(
                 continue;
             }
             const std::string_view name(field.name);
-            int32_t* destination = nullptr;
-            uint32_t bit = 0;
-            if (name == "stage") {
-                destination = &parameters.stage; bit = 1U << 0;
-            } else if (name == "layer_index") {
-                destination = &parameters.layerIndex; bit = 1U << 1;
-            } else if (name == "input_height") {
-                destination = &parameters.inputHeight; bit = 1U << 2;
-            } else if (name == "input_width") {
-                destination = &parameters.inputWidth; bit = 1U << 3;
-            } else if (name == "input_channels") {
-                destination = &parameters.inputChannels; bit = 1U << 4;
-            } else if (name == "output_height") {
-                destination = &parameters.outputHeight; bit = 1U << 5;
-            } else if (name == "output_width") {
-                destination = &parameters.outputWidth; bit = 1U << 6;
-            } else if (name == "output_channels") {
-                destination = &parameters.outputChannels; bit = 1U << 7;
-            } else if (name == "kernel_height") {
-                destination = &parameters.kernelHeight; bit = 1U << 8;
-            } else if (name == "kernel_width") {
-                destination = &parameters.kernelWidth; bit = 1U << 9;
-            } else if (name == "stride_height") {
-                destination = &parameters.strideHeight; bit = 1U << 10;
-            } else if (name == "stride_width") {
-                destination = &parameters.strideWidth; bit = 1U << 11;
-            } else if (name == "groups") {
-                destination = &parameters.groups; bit = 1U << 12;
-            } else if (name == "packed_k") {
-                destination = &parameters.packedK; bit = 1U << 13;
-            } else if (name == "packed_n") {
-                destination = &parameters.packedN; bit = 1U << 14;
-            } else if (name == "fuse_layernorm") {
-                destination = &parameters.fuseLayerNorm; bit = 1U << 15;
-            } else if (name == "int8_mode") {
-                destination = &parameters.int8Mode; bit = 1U << 16;
-            }
-
-            if (destination != nullptr) {
-                if (!readScalarInt32(field, *destination)) {
+            bool integerField = false;
+            for (const IntegerFieldSpec& spec : kIntegerFieldSpecs) {
+                if (name != spec.name) {
+                    continue;
+                }
+                if (!readScalarInt32(field, parameters.*spec.member)) {
                     return nullptr;
                 }
-                seen |= bit;
-            } else if (name == "activation_scale") {
+                seen |= spec.seenBit;
+                integerField = true;
+                break;
+            }
+            if (integerField) {
+                continue;
+            }
+            if (name == "activation_scale") {
                 if (!readScalarFloat(field, parameters.activationScale)) {
                     return nullptr;
                 }
@@ -710,7 +709,6 @@ nvinfer1::IPluginV3* FusedSpatialReductionPluginCreator::createPlugin(
             }
         }
 
-        constexpr uint32_t kRequiredIntegerFields = (1U << 16) - 1U;
         const char* expectedInputLayout = parameters.int8Mode == 1
             ? kInt8InputLayout
             : kFusedQuantizeInputLayout;
