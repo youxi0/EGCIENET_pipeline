@@ -293,8 +293,10 @@ __global__ void fusedInt8SpatialReductionKernel(
         ctaTokenBase,
         channelBlock
     );
+    // 提交这一批异步copy
     asm volatile("cp.async.commit_group;\n" ::);
     asm volatile("cp.async.wait_group 0;\n" ::);
+    // CTA所有线程对齐
     __syncthreads();
 
 #pragma unroll
